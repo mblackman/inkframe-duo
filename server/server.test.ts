@@ -136,17 +136,92 @@ describe("InkFrame Duo Core Suite", () => {
       expect(img.width).toBe(800);
       expect(img.height).toBe(480);
     });
+
+    it("supports ordered Bayer dithering with strict Spectra 6 theoretical palette", async () => {
+      const bgCanvas = createCanvas(WIDTH, HEIGHT);
+      const bgCtx = bgCanvas.getContext("2d");
+      const grad = bgCtx.createLinearGradient(0, 0, WIDTH, HEIGHT);
+      grad.addColorStop(0, "#d9822b");
+      grad.addColorStop(1, "#3b5998");
+      bgCtx.fillStyle = grad;
+      bgCtx.fillRect(0, 0, WIDTH, HEIGHT);
+
+      const rendered = await renderHybridNote({
+        backgroundDataUrl: bgCanvas.toDataURL(),
+        ditherAlgorithm: "bayer" as any,
+      });
+
+      const nearest = await renderHybridNote({
+        backgroundDataUrl: bgCanvas.toDataURL(),
+        ditherAlgorithm: "nearest",
+      });
+
+      expect(rendered.paletteIndices).not.toEqual(nearest.paletteIndices);
+
+      const testImg = await loadImage(rendered.devicePngBuffer);
+      expect(testImg.width).toBe(WIDTH);
+      expect(testImg.height).toBe(HEIGHT);
+
+      const checkCanvas = createCanvas(WIDTH, HEIGHT);
+      const checkCtx = checkCanvas.getContext("2d");
+      checkCtx.drawImage(testImg, 0, 0);
+      const { data } = checkCtx.getImageData(0, 0, WIDTH, HEIGHT);
+
+      const theoreticalSet = new Set(
+        SPECTRA_6_PALETTE.map((c) => `${c.theoretical[0]},${c.theoretical[1]},${c.theoretical[2]}`)
+      );
+
+      for (let i = 0; i < data.length; i += 4) {
+        const rgbKey = `${data[i]},${data[i + 1]},${data[i + 2]}`;
+        expect(theoreticalSet.has(rgbKey)).toBe(true);
+      }
+    });
+
+    it("preserves exact paletteIndices with zero generation-loss when remixing a rendered preview", async () => {
+      const bgCanvas = createCanvas(WIDTH, HEIGHT);
+      const bgCtx = bgCanvas.getContext("2d");
+      const grad = bgCtx.createLinearGradient(0, 0, WIDTH, HEIGHT);
+      grad.addColorStop(0, "#4a90e2");
+      grad.addColorStop(0.5, "#f5a623");
+      grad.addColorStop(1, "#7ed321");
+      bgCtx.fillStyle = grad;
+      bgCtx.fillRect(0, 0, WIDTH, HEIGHT);
+
+      const initial = await renderHybridNote({
+        backgroundDataUrl: bgCanvas.toDataURL(),
+        ditherAlgorithm: "floyd",
+      });
+
+      const previewDataUrl = `data:image/png;base64,${initial.previewPngBuffer.toString("base64")}`;
+
+      const remixedFloyd = await renderHybridNote({
+        backgroundDataUrl: previewDataUrl,
+        exposure: 1.0,
+        contrast: 1.0,
+        ditherAlgorithm: "floyd",
+      });
+      expect(remixedFloyd.paletteIndices).toEqual(initial.paletteIndices);
+
+      const remixedBayer = await renderHybridNote({
+        backgroundDataUrl: previewDataUrl,
+        exposure: 1.0,
+        contrast: 1.0,
+        ditherAlgorithm: "bayer" as any,
+      });
+      expect(remixedBayer.paletteIndices).toEqual(initial.paletteIndices);
+    });
   });
 
   // ---------------------------------------------------------------------------
   // 3. HTTP Server, ETag Protocol, and Device Coordination
   // ---------------------------------------------------------------------------
   describe("Device HTTP Protocol & Caching", () => {
-    function setupTestServer(options: { devices?: string; token?: string } = {}) {
+    function setupTestServer(options: { devices?: string; token?: string; webPin?: string } = {}) {
       const config: AppConfig = {
         port: 0, // In-memory/virtual fetch
         dataDir: testDir,
         globalFrameToken: options.token,
+        webPin: options.webPin,
         devices: parseDevicesConfig(options.devices || "frame-wife:Wife's Desk Frame,frame-matt:Matt's Desk Frame", options.token),
       };
       return createServer(config, testDb);
@@ -328,6 +403,97 @@ describe("InkFrame Duo Core Suite", () => {
       expect(resendRes.status).toBe(200);
       const resendJson = await resendRes.json();
       expect(resendJson.ok).toBe(true);
+    });
+
+    it("enforces X-Pin consistently on note creation, resend, and deletion when webPin is set", async () => {
+      const { server } = setupTestServer({ webPin: "4321" });
+
+      const inkCanvas = createCanvas(WIDTH, HEIGHT);
+      const inkCtx = inkCanvas.getContext("2d");
+      inkCtx.fillStyle = "#000000";
+      inkCtx.fillRect(10, 10, 20, 20);
+      const inkDataUrl = inkCanvas.toDataURL();
+
+      // 1. POST /api/notes without PIN -> 401
+      const noPinCreate = await server.fetch(
+        new Request("http://localhost/api/notes", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ recipient: "wife", inkDataUrl }),
+        })
+      );
+      expect(noPinCreate.status).toBe(401);
+
+      // 2. POST /api/notes with wrong PIN -> 401
+      const wrongPinCreate = await server.fetch(
+        new Request("http://localhost/api/notes", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-pin": "0000" },
+          body: JSON.stringify({ recipient: "wife", inkDataUrl }),
+        })
+      );
+      expect(wrongPinCreate.status).toBe(401);
+
+      // 3. POST /api/notes with valid PIN -> 200
+      const validCreate = await server.fetch(
+        new Request("http://localhost/api/notes", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-pin": "4321" },
+          body: JSON.stringify({ recipient: "wife", inkDataUrl }),
+        })
+      );
+      expect(validCreate.status).toBe(200);
+      const created = await validCreate.json();
+
+      // 4. POST /api/notes/:id/resend without / wrong PIN -> 401, valid PIN -> 200
+      const noPinResend = await server.fetch(
+        new Request(`http://localhost/api/notes/${created.id}/resend`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ recipient: "frame-matt" }),
+        })
+      );
+      expect(noPinResend.status).toBe(401);
+
+      const wrongPinResend = await server.fetch(
+        new Request(`http://localhost/api/notes/${created.id}/resend`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-pin": "9999" },
+          body: JSON.stringify({ recipient: "frame-matt" }),
+        })
+      );
+      expect(wrongPinResend.status).toBe(401);
+
+      const validResend = await server.fetch(
+        new Request(`http://localhost/api/notes/${created.id}/resend`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-pin": "4321" },
+          body: JSON.stringify({ recipient: "frame-matt" }),
+        })
+      );
+      expect(validResend.status).toBe(200);
+
+      // 5. DELETE /api/notes/:id without / wrong PIN -> 401, valid PIN -> 200
+      const noPinDelete = await server.fetch(
+        new Request(`http://localhost/api/notes/${created.id}`, { method: "DELETE" })
+      );
+      expect(noPinDelete.status).toBe(401);
+
+      const wrongPinDelete = await server.fetch(
+        new Request(`http://localhost/api/notes/${created.id}`, {
+          method: "DELETE",
+          headers: { "x-pin": "9999" },
+        })
+      );
+      expect(wrongPinDelete.status).toBe(401);
+
+      const validDelete = await server.fetch(
+        new Request(`http://localhost/api/notes/${created.id}`, {
+          method: "DELETE",
+          headers: { "x-pin": "4321" },
+        })
+      );
+      expect(validDelete.status).toBe(200);
     });
   });
 });

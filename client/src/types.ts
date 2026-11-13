@@ -41,10 +41,99 @@ export interface SystemState {
   config: ConfigInfo;
 }
 
-export type DitherAlgo = "floyd" | "atkinson" | "nearest";
+export type DitherAlgo = "floyd" | "atkinson" | "bayer" | "nearest";
 
 export interface ColorOption {
   name: string;
   hex: string;
-  isEraser?: boolean;
+  isWhite?: boolean;
 }
+
+export type ToolMode = "arrange" | "draw" | "eraser" | "text" | "stamp" | "paper";
+
+export type BrushStyle = "pen" | "marker" | "calligraphy" | "halftone";
+
+export type DrawMode = "freehand" | "line" | "rect" | "circle" | "heart" | "fill";
+
+export type TemplateId =
+  | "blank"
+  | "airmail"
+  | "postcard"
+  | "dotted"
+  | "memo"
+  | "tictactoe"
+  | "hangman";
+
+export type StampId =
+  | "heart"
+  | "star"
+  | "coffee"
+  | "sun"
+  | "cloud"
+  | "postmark"
+  | "bubble"
+  | "cat"
+  | "arrow"
+  | "check";
+
+export type FrameStyle = "none" | "polaroid" | "stamp";
+
+export type CollageLayoutId = "full" | "split" | "scatter" | "strip";
+
+export interface ImageCrop {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface ImageLayer {
+  id: string;
+  src: string;
+  naturalWidth: number;
+  naturalHeight: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  scale: number;
+  rotation: number;
+  flipX: boolean;
+  brightness: number;
+  contrast: number;
+  frameStyle: FrameStyle;
+  crop: ImageCrop;
+}
+
+export type TextFont = "handwritten" | "typewriter" | "bold" | "pixel";
+
+export type TextBackdrop = "none" | "pill-light" | "pill-dark";
+
+export interface TextLayer {
+  id: string;
+  text: string;
+  x: number;
+  y: number;
+  fontSize: number;
+  scale: number;
+  rotation: number;
+  color: string;
+  font: TextFont;
+  backdrop: TextBackdrop;
+}
+
+export interface StampLayer {
+  id: string;
+  stampId: StampId;
+  x: number;
+  y: number;
+  size: number;
+  scale: number;
+  rotation: number;
+  color: string;
+}
+
+export type SelectedItem = {
+  kind: "image" | "text" | "stamp";
+  id: string;
+} | null;

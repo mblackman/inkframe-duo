@@ -19,10 +19,27 @@ export const SPECTRA_6_PALETTE: SpectraColor[] = [
   { name: "Blue", theoretical: [0, 0, 255], perceived: [37, 70, 122], hex: "#0000FF" },
 ];
 
-export type DitherAlgorithm = "floyd" | "atkinson" | "nearest";
+export type DitherAlgorithm = "floyd" | "atkinson" | "bayer" | "nearest";
+
+const BAYER_4X4 = [
+  [0, 8, 2, 10],
+  [12, 4, 14, 6],
+  [3, 11, 1, 9],
+  [15, 7, 13, 5],
+];
 
 function clampByte(val: number): number {
   return val < 0 ? 0 : val > 255 ? 255 : val;
+}
+
+function isExactPerceivedPaletteColor(r: number, g: number, b: number): boolean {
+  for (let i = 0; i < SPECTRA_6_PALETTE.length; i++) {
+    const [pr, pg, pb] = SPECTRA_6_PALETTE[i].perceived;
+    if (Math.abs(r - pr) <= 1 && Math.abs(g - pg) <= 1 && Math.abs(b - pb) <= 1) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function findNearestPerceivedIndex(r: number, g: number, b: number): number {
@@ -131,13 +148,28 @@ export async function renderHybridNote(opts: RenderOptions): Promise<RenderedFra
       const oldG = floatBuf[idx3 + 1];
       const oldB = floatBuf[idx3 + 2];
 
+      let targetR = oldR;
+      let targetG = oldG;
+      let targetB = oldB;
+
+      if (
+        opts.backgroundDataUrl &&
+        ditherAlgo === "bayer" &&
+        !isExactPerceivedPaletteColor(oldR, oldG, oldB)
+      ) {
+        const bayerOffset = (BAYER_4X4[y & 3][x & 3] / 16 - 0.5) * 48;
+        targetR = clampByte(oldR + bayerOffset);
+        targetG = clampByte(oldG + bayerOffset);
+        targetB = clampByte(oldB + bayerOffset);
+      }
+
       const nearestIdx = opts.backgroundDataUrl
-        ? findNearestPerceivedIndex(oldR, oldG, oldB)
+        ? findNearestPerceivedIndex(targetR, targetG, targetB)
         : 1; // Default to Paper White (index 1) if no background photo
 
       paletteIndices[pIdx] = nearestIdx;
 
-      if (opts.backgroundDataUrl && ditherAlgo !== "nearest") {
+      if (opts.backgroundDataUrl && ditherAlgo !== "nearest" && ditherAlgo !== "bayer") {
         const [pr, pg, pb] = SPECTRA_6_PALETTE[nearestIdx].perceived;
         const er = oldR - pr;
         const eg = oldG - pg;
@@ -170,8 +202,8 @@ export async function renderHybridNote(opts: RenderOptions): Promise<RenderedFra
     const inkData = inkCtx.getImageData(0, 0, WIDTH, HEIGHT).data;
 
     for (let i = 0, pIdx = 0; i < inkData.length; i += 4, pIdx++) {
-      // Threshold alpha to capture crisp line art
-      if (inkData[i + 3] > 64) {
+      // Threshold alpha to capture crisp line art without dark halo fringes
+      if (inkData[i + 3] >= 96) {
         paletteIndices[pIdx] = findNearestPerceivedIndex(
           inkData[i],
           inkData[i + 1],

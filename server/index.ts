@@ -15,6 +15,22 @@ export function cleanEtag(etag?: string | null): string {
   return clean;
 }
 
+function requirePin(
+  req: Request,
+  webPin: string | undefined,
+  corsHeaders: Record<string, string>
+): Response | null {
+  if (!webPin) return null;
+  const pin = req.headers.get("x-pin");
+  if (pin !== webPin) {
+    return Response.json(
+      { error: "Invalid or missing PIN" },
+      { status: 401, headers: corsHeaders }
+    );
+  }
+  return null;
+}
+
 export function createServer(customConfig?: AppConfig, customDb?: AppDatabase) {
   const config = customConfig || loadAppConfig();
   const db = customDb || getDb();
@@ -22,9 +38,9 @@ export function createServer(customConfig?: AppConfig, customDb?: AppDatabase) {
   // Ensure configured devices are seeded into database
   db.syncDevices(config.devices);
 
-  const server = Bun.serve({
+  const server: ReturnType<typeof Bun.serve> = Bun.serve({
     port: config.port,
-    async fetch(req) {
+    async fetch(req: Request): Promise<Response> {
       const url = new URL(req.url);
 
       // CORS headers for local dev / cross-origin preview
@@ -181,15 +197,8 @@ export function createServer(customConfig?: AppConfig, customDb?: AppDatabase) {
       // 2. Submit New Handwritten Note: POST /api/notes
       // -----------------------------------------------------------------------
       if (req.method === "POST" && url.pathname === "/api/notes") {
-        if (config.webPin) {
-          const pin = req.headers.get("x-pin");
-          if (pin !== config.webPin) {
-            return Response.json(
-              { error: "Invalid or missing PIN" },
-              { status: 401, headers: corsHeaders }
-            );
-          }
-        }
+        const pinError = requirePin(req, config.webPin, corsHeaders);
+        if (pinError) return pinError;
 
         const body = await req.json().catch(() => null);
         if (!body) {
@@ -267,6 +276,9 @@ export function createServer(customConfig?: AppConfig, customDb?: AppDatabase) {
       // 3. Re-Send Historical Note: POST /api/notes/:id/resend
       // -----------------------------------------------------------------------
       if (req.method === "POST" && url.pathname.match(/^\/api\/notes\/[^/]+\/resend$/)) {
+        const pinError = requirePin(req, config.webPin, corsHeaders);
+        if (pinError) return pinError;
+
         const parts = url.pathname.split("/");
         const noteId = parts[3];
         const note = db.getNote(noteId);
@@ -297,6 +309,9 @@ export function createServer(customConfig?: AppConfig, customDb?: AppDatabase) {
       // 4. Delete Note: DELETE /api/notes/:id
       // -----------------------------------------------------------------------
       if (req.method === "DELETE" && url.pathname.match(/^\/api\/notes\/[^/]+$/)) {
+        const pinError = requirePin(req, config.webPin, corsHeaders);
+        if (pinError) return pinError;
+
         const noteId = url.pathname.split("/")[3];
         db.deleteNote(noteId);
 

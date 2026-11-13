@@ -35,7 +35,7 @@ canvas {
 }
 
 /* Custom high-contrast focus ring */
-:where(a:any-link, button, input, summary):focus-visible {
+:where(a:any-link, button, input, textarea, select, summary):focus-visible {
   outline: 3px solid #25467a;
   outline-offset: 3px;
 }
