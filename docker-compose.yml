@@ -14,4 +14,4 @@ services:
       # - FRAME_TOKEN=${FRAME_TOKEN:-}
       # - WEB_PIN=${WEB_PIN:-}
     volumes:
-      - ./data:/data
+      - ${DATA_PATH:-./data}:/data
