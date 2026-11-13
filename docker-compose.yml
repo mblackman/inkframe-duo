@@ -4,14 +4,14 @@ services:
     container_name: inkframe-duo
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "${HOST_PORT:-3000}:3000"
     environment:
       - PORT=3000
       - DATA_DIR=/data
       # Configure 1..N frames: "deviceId:Display Name[:optionalToken]"
-      - INKFRAME_DEVICES=frame-wife:Wife's Desk Frame,frame-matt:Matt's Desk Frame
+      - INKFRAME_DEVICES=${INKFRAME_DEVICES:-frame-device-1:Device 1,frame-device-2:Device 2}
       # Optional: set a token or web PIN if exposing outside local network
-      # - FRAME_TOKEN=
-      # - WEB_PIN=
+      # - FRAME_TOKEN=${FRAME_TOKEN:-}
+      # - WEB_PIN=${WEB_PIN:-}
     volumes:
       - ./data:/data
