@@ -49,11 +49,55 @@ export interface ColorOption {
   isWhite?: boolean;
 }
 
-export type ToolMode = "arrange" | "draw" | "eraser" | "text" | "stamp" | "paper";
+export type ToolMode =
+  | "pen"
+  | "eraser"
+  | "figure"
+  | "fill"
+  | "eyedropper"
+  | "arrange"
+  | "hand"
+  | "text"
+  | "stamp"
+  | "paper";
 
-export type BrushStyle = "pen" | "marker" | "calligraphy" | "halftone";
+export type BrushStyle =
+  | "pen"
+  | "marker"
+  | "calligraphy"
+  | "pencil"
+  | "tone25"
+  | "halftone"
+  | "tone75";
 
-export type DrawMode = "freehand" | "line" | "rect" | "circle" | "heart" | "fill";
+export type EraserStyle = "hard" | "kneaded";
+
+export type FigureShape = "line" | "rect" | "circle" | "heart" | "star";
+
+export type FigureFillMode = "stroke" | "fill" | "both";
+
+export type FillReferenceMode = "all" | "active-ink";
+
+export type ActiveColorSlot = "main" | "sub" | "transparent";
+
+export type ToneBackingMode = "transparent" | "sub";
+
+export type DrawMode = "freehand" | FigureShape | "fill";
+
+export interface InkLayerItem {
+  id: string;
+  name: string;
+  visible: boolean;
+  locked: boolean;
+}
+
+export interface OpticalMixSwatch {
+  id: string;
+  label: string;
+  primaryHex: string;
+  secondaryHex: string;
+  density: "tone25" | "halftone" | "tone75";
+}
 
 export type TemplateId =
   | "blank"

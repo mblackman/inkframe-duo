@@ -2,7 +2,10 @@ import { describe, expect, it } from "bun:test";
 import {
   StrokeSmoother,
   shouldPaintHalftonePixel,
+  shouldPaintTonePixel,
   floodFillBuffer,
+  constrainShapePoints,
+  mergeBoundaryBuffers,
 } from "./stroke";
 import {
   CANVAS_WIDTH,
@@ -13,11 +16,18 @@ import {
   snapAngle,
   computeSnapPosition,
   computeCollageLayout,
+  screenRectToCanvasPoint,
 } from "./transforms";
 import {
   SPECTRA_PERCEIVED_COLORS,
   quantizeAndDitherRgba,
 } from "./dither";
+import {
+  SPECTRA_PALETTE,
+  OPTICAL_MIX_SWATCHES,
+  hexToRgba,
+  sampleSpectraColorHex,
+} from "./palette-swatches";
 import type { ImageLayer } from "../types";
 
 describe("Client Studio Engines", () => {
@@ -262,6 +272,168 @@ describe("Client Studio Engines", () => {
         const inkIdx = (5 * w + 5) * 4;
         expect([out[inkIdx], out[inkIdx + 1], out[inkIdx + 2]]).toEqual([37, 70, 122]);
       }
+    });
+
+    it("provides 12 curated optical mix swatches using strictly valid Spectra 6 hexes and samples nearest Spectra hex", () => {
+      const validHexes = new Set(SPECTRA_PALETTE.map((c) => c.hex));
+      expect(SPECTRA_PALETTE).toHaveLength(6);
+      expect(OPTICAL_MIX_SWATCHES).toHaveLength(12);
+
+      for (const sw of OPTICAL_MIX_SWATCHES) {
+        expect(validHexes.has(sw.primaryHex)).toBe(true);
+        expect(validHexes.has(sw.secondaryHex)).toBe(true);
+        expect(["tone25", "halftone", "tone75"]).toContain(sw.density);
+      }
+
+      expect(hexToRgba("#9e2a1f")).toEqual([158, 42, 31, 255]);
+      expect(sampleSpectraColorHex(160, 44, 30)).toBe("#9e2a1f");
+      expect(sampleSpectraColorHex(35, 72, 125)).toBe("#25467a");
+    });
+  });
+
+  describe("Clip Studio Paint Engine Extensions", () => {
+    it("computes deterministic screentone densities for tone25 (25%), halftone (50%), tone75 (75%), and dry pencil", () => {
+      const total = 16 * 16;
+      const countCoverage = (style: "tone25" | "halftone" | "tone75" | "pencil") => {
+        let count = 0;
+        for (let y = 0; y < 16; y++) {
+          for (let x = 0; x < 16; x++) {
+            if (shouldPaintTonePixel(x, y, style)) count++;
+          }
+        }
+        return count;
+      };
+
+      expect(countCoverage("tone25")).toBe(total * 0.25);
+      expect(countCoverage("halftone")).toBe(total * 0.5);
+      expect(countCoverage("tone75")).toBe(total * 0.75);
+
+      const pencilCount = countCoverage("pencil");
+      expect(pencilCount).toBeGreaterThan(total * 0.4);
+      expect(pencilCount).toBeLessThan(total * 0.8);
+      expect(shouldPaintTonePixel(7, 11, "pencil")).toBe(shouldPaintTonePixel(7, 11, "pencil"));
+    });
+
+    it("stabilizes jittery strokes and converges cleanly to the final raw endpoint, and supports taper: false", () => {
+      const jittery = new StrokeSmoother(8, "pen", { stabilization: 8, taper: true });
+      const rawPoints = [
+        { x: 0, y: 100, time: 0 },
+        { x: 20, y: 80, time: 10 },
+        { x: 40, y: 120, time: 20 },
+        { x: 60, y: 80, time: 30 },
+        { x: 80, y: 100, time: 40 },
+      ];
+      const stamps = [
+        ...jittery.startStroke(rawPoints[0]),
+        ...jittery.addPoint(rawPoints[1]),
+        ...jittery.addPoint(rawPoints[2]),
+        ...jittery.addPoint(rawPoints[3]),
+        ...jittery.addPoint(rawPoints[4]),
+        ...jittery.finishStroke(),
+      ];
+
+      const maxDeviation = Math.max(...stamps.map((s) => Math.abs(s.y - 100)));
+      expect(maxDeviation).toBeLessThan(15);
+      const last = stamps[stamps.length - 1];
+      expect(last.x).toBeCloseTo(80, 1);
+      expect(last.y).toBeCloseTo(100, 1);
+
+      const untapered = new StrokeSmoother(10, "pen", { stabilization: 0, taper: false });
+      const s0 = untapered.startStroke({ x: 0, y: 0, time: 0, pressure: 0.2, pointerType: "pen" });
+      const s1 = untapered.addPoint({ x: 120, y: 0, time: 2, pressure: 0.9, pointerType: "pen" });
+      const s2 = untapered.finishStroke();
+      for (const st of [...s0, ...s1, ...s2]) {
+        expect(st.radius).toBeCloseTo(5, 5);
+      }
+    });
+
+    it("constrains line angles to 15° increments and locks box shapes to 1:1 when shiftConstrain is true", () => {
+      const lineFree = constrainShapePoints("line", { x: 100, y: 100 }, { x: 195, y: 120 }, false);
+      expect(lineFree).toEqual({ x: 195, y: 120 });
+
+      // ~11.8 deg snaps to 15 deg
+      const lineSnapped = constrainShapePoints("line", { x: 100, y: 100 }, { x: 195, y: 120 }, true);
+      const snappedAngle = Math.atan2(lineSnapped.y - 100, lineSnapped.x - 100);
+      expect(snappedAngle).toBeCloseTo(Math.PI / 12, 4);
+
+      const rectSquare = constrainShapePoints("rect", { x: 50, y: 60 }, { x: 150, y: 90 }, true);
+      expect(Math.abs(rectSquare.x - 50)).toBeCloseTo(Math.abs(rectSquare.y - 60), 5);
+      expect(Math.abs(rectSquare.x - 50)).toBe(100);
+    });
+
+    it("merges multi-layer boundary buffers for cross-layer fill and supports 2-color halftone flood fill", () => {
+      const w = 10;
+      const h = 10;
+      const layerA = new Uint8ClampedArray(w * h * 4);
+      const layerB = new Uint8ClampedArray(w * h * 4);
+
+      // Horizontal top/bottom border in layerA, vertical left/right border in layerB
+      for (let x = 2; x <= 7; x++) {
+        layerA[(2 * w + x) * 4 + 3] = 255;
+        layerA[(7 * w + x) * 4 + 3] = 255;
+      }
+      for (let y = 2; y <= 7; y++) {
+        layerB[(y * w + 2) * 4 + 3] = 255;
+        layerB[(y * w + 7) * 4 + 3] = 255;
+      }
+
+      const boundary = mergeBoundaryBuffers([layerA, layerB]);
+      expect(boundary).toBeDefined();
+
+      const targetColorLayer = new Uint8ClampedArray(w * h * 4);
+      const red: [number, number, number, number] = [158, 42, 31, 255];
+      const yellow: [number, number, number, number] = [217, 184, 44, 255];
+
+      const changed = floodFillBuffer(
+        targetColorLayer,
+        w,
+        h,
+        4,
+        4,
+        red,
+        boundary,
+        { mode: "halftone", secondaryRgba: yellow }
+      );
+      expect(changed).toBe(true);
+
+      // Exterior stays empty (no leak across combined boundary)
+      expect(targetColorLayer[3]).toBe(0);
+      expect(targetColorLayer[(9 * w + 9) * 4 + 3]).toBe(0);
+
+      // Interior contains both red and yellow pixels in deterministic checkerboard
+      let sawRed = false;
+      let sawYellow = false;
+      for (let y = 3; y <= 6; y++) {
+        for (let x = 3; x <= 6; x++) {
+          const i = (y * w + x) * 4;
+          const rgba = [
+            targetColorLayer[i],
+            targetColorLayer[i + 1],
+            targetColorLayer[i + 2],
+            targetColorLayer[i + 3],
+          ];
+          if (shouldPaintHalftonePixel(x, y)) {
+            expect(rgba).toEqual(red);
+            sawRed = true;
+          } else {
+            expect(rgba).toEqual(yellow);
+            sawYellow = true;
+          }
+        }
+      }
+      expect(sawRed).toBe(true);
+      expect(sawYellow).toBe(true);
+    });
+
+    it("maps screen rect pointer coordinates accurately under zoom, offset, and viewFlipX", () => {
+      const rect = { left: 100, top: 50, width: 1600, height: 960 }; // 200% zoom
+      const normal = screenRectToCanvasPoint(500, 290, rect, false);
+      expect(normal.x).toBeCloseTo(200, 5);
+      expect(normal.y).toBeCloseTo(120, 5);
+
+      const flipped = screenRectToCanvasPoint(500, 290, rect, true);
+      expect(flipped.x).toBeCloseTo(600, 5);
+      expect(flipped.y).toBeCloseTo(120, 5);
     });
   });
 });

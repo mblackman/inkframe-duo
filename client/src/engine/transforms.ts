@@ -24,6 +24,24 @@ export type HandleKind =
   | "crop-w"
   | "crop-e";
 
+/**
+ * Maps client pointer coordinates into 800x480 canvas coordinates,
+ * accounting for viewport zoom, pan, and horizontal Mirror View flip.
+ */
+export function screenRectToCanvasPoint(
+  clientX: number,
+  clientY: number,
+  rect: { left: number; top: number; width: number; height: number },
+  viewFlipX = false
+): { x: number; y: number } {
+  const normX = (clientX - rect.left) / Math.max(1, rect.width);
+  const normY = (clientY - rect.top) / Math.max(1, rect.height);
+  return {
+    x: (viewFlipX ? 1 - normX : normX) * CANVAS_WIDTH,
+    y: normY * CANVAS_HEIGHT,
+  };
+}
+
 export function worldToLocal(
   px: number,
   py: number,

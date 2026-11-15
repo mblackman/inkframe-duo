@@ -1,44 +1,41 @@
-import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
-  Send,
-  RotateCcw,
-  Undo2,
-  Redo2,
-  Trash2,
+  AlertCircle,
   Battery,
-  Thermometer,
-  Droplets,
+  Check,
   Clock,
   Copy,
-  Check,
-  RefreshCw,
-  Sliders,
-  Sparkles,
-  Wifi,
-  Eraser,
-  BookOpen,
-  X,
+  Droplets,
   Heart,
-  ChevronDown,
+  Minus,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Sliders,
+  Thermometer,
   Wand2,
-  Move,
-  PenTool,
-  Type,
-  Stamp as StampIcon,
-  FileText,
-  ImagePlus,
-  Eye,
-  Reply,
-  AlertCircle,
+  Wifi,
+  X,
 } from "lucide-react";
 import type {
   BrushStyle,
   CollageLayoutId,
-  ColorOption,
   DeviceItem,
   DitherAlgo,
-  DrawMode,
+  EraserStyle,
+  FigureFillMode,
+  FigureShape,
+  FillReferenceMode,
   ImageLayer,
+  InkLayerItem,
+  OpticalMixSwatch,
   SelectedItem,
   StampId,
   StampLayer,
@@ -53,6 +50,7 @@ import {
   StrokeSmoother,
   drawShape,
   floodFillBuffer,
+  mergeBoundaryBuffers,
   renderStampsToContext,
   type StrokeInputPoint,
 } from "./engine/stroke";
@@ -66,6 +64,7 @@ import {
   getRotationHandlePos,
   hitTestBox,
   hitTestHandles,
+  screenRectToCanvasPoint,
   snapAngle,
   worldToLocal,
   type HandleKind,
@@ -73,35 +72,35 @@ import {
 } from "./engine/transforms";
 import { quantizeAndDitherRgba } from "./engine/dither";
 import {
+  OPTICAL_MIX_SWATCHES,
+  SPECTRA_PALETTE,
+  hexToRgba,
+  sampleSpectraColorHex,
+} from "./engine/palette-swatches";
+import {
   drawImageLayerFrameCrisp,
   drawStamp,
   drawStationeryTemplate,
   drawTextLayer,
   measureTextLayerBounds,
 } from "./engine/templates";
-import { StudioToolbars } from "./components/StudioToolbars";
+import { PostcardHeader } from "./components/PostcardHeader";
+import { InkPaletteCard, type InkTextureMode } from "./components/InkPaletteCard";
+import { TracingSheetsCard } from "./components/TracingSheetsCard";
+import { NIB_SIZE_PRESETS, PencilCaseDock } from "./components/PencilCaseDock";
+import { ScrapbookDialog } from "./components/ScrapbookDialog";
 
 const DRAFT_STORAGE_KEY = "inkframe-studio-draft-v1";
 const MAX_UNDO = 25;
+const MAX_INK_LAYERS = 4;
 
-const SPECTRA_PALETTE: ColorOption[] = [
-  { name: "Ink Black", hex: "#1e1e1e" },
-  { name: "Paper White", hex: "#e8e4d9", isWhite: true },
-  { name: "Crimson Red", hex: "#9e2a1f" },
-  { name: "Sunbeam Yellow", hex: "#d9b82c" },
-  { name: "Forest Green", hex: "#2d6a3e" },
-  { name: "Cobalt Blue", hex: "#25467a" },
-];
-
-const BRUSH_SIZES = [
-  { label: "Fine", size: 3, dot: 5 },
-  { label: "Medium", size: 6, dot: 8 },
-  { label: "Bold", size: 12, dot: 12 },
-  { label: "Chubby", size: 24, dot: 16 },
-];
+interface InkLayerSnapshot extends InkLayerItem {
+  data: ImageData;
+}
 
 interface StudioSnapshot {
-  ink: ImageData;
+  inkLayers: InkLayerSnapshot[];
+  activeInkLayerId: string;
   images: ImageLayer[];
   texts: TextLayer[];
   stamps: StampLayer[];
@@ -130,14 +129,25 @@ type DragGesture =
       startScale: number;
       startRotation: number;
       moved: boolean;
+    }
+  | {
+      type: "viewport-pan";
+      startClient: { x: number; y: number };
+      startPan: { x: number; y: number };
+    }
+  | {
+      type: "viewport-pinch";
+      startDist: number;
+      startMidClient: { x: number; y: number };
+      startZoom: number;
+      startPan: { x: number; y: number };
     };
 
-function hexToRgba(hex: string): [number, number, number, number] {
-  const clean = hex.replace("#", "");
-  const r = parseInt(clean.slice(0, 2), 16) || 0;
-  const g = parseInt(clean.slice(2, 4), 16) || 0;
-  const b = parseInt(clean.slice(4, 6), 16) || 0;
-  return [r, g, b, 255];
+function createDefaultInkLayers(): InkLayerItem[] {
+  return [
+    { id: "ink-color", name: "Coloring", visible: true, locked: false },
+    { id: "ink-lineart", name: "Lineart", visible: true, locked: false },
+  ];
 }
 
 function makeId(prefix: string): string {
@@ -203,7 +213,25 @@ function loadImageElement(src: string): Promise<HTMLImageElement> {
   });
 }
 
-// Feature detection for top-layer exit transitions
+function imageDataToDataUrl(data: ImageData): string {
+  const c = document.createElement("canvas");
+  c.width = CANVAS_WIDTH;
+  c.height = CANVAS_HEIGHT;
+  c.getContext("2d")?.putImageData(data, 0, 0);
+  return c.toDataURL("image/png");
+}
+
+async function dataUrlToImageData(dataUrl: string): Promise<ImageData> {
+  const img = await loadImageElement(dataUrl);
+  const c = document.createElement("canvas");
+  c.width = CANVAS_WIDTH;
+  c.height = CANVAS_HEIGHT;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT);
+  ctx.drawImage(img, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+  return ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+}
+
 let supportsDisplayTransition: boolean | undefined;
 function canTransitionDisplay(): boolean {
   if (supportsDisplayTransition !== undefined) return supportsDisplayTransition;
@@ -255,25 +283,54 @@ export default function App() {
   const [isSending, setIsSending] = useState(false);
   const [sendSuccessBanner, setSendSuccessBanner] = useState<string | null>(null);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [statusAnnouncement, setStatusAnnouncement] = useState<string>("");
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
   const [simulatingDevice, setSimulatingDevice] = useState<string | null>(null);
-  const [simulationResult, setSimulationResult] = useState<{ deviceId: string; text: string } | null>(null);
+  const [simulationResult, setSimulationResult] = useState<{
+    deviceId: string;
+    text: string;
+  } | null>(null);
 
-  // Composer & Tool State
-  const [selectedRecipient, setSelectedRecipient] = useState<string>("all");
-  const [activeTool, setActiveTool] = useState<ToolMode>("draw");
-  const [brushStyle, setBrushStyle] = useState<BrushStyle>("pen");
-  const [drawMode, setDrawMode] = useState<DrawMode>("freehand");
-  const [currentColor, setCurrentColor] = useState<string>("#1e1e1e");
-  const [brushSize, setBrushSize] = useState<number>(6);
-  const [ditherAlgo, setDitherAlgo] = useState<DitherAlgo>("floyd");
+  // Canvas Viewport State (Crisp 1:1 Fit + Optional Zoom/Pan + E-Ink Peek)
+  const [wellSize, setWellSize] = useState<{ width: number; height: number }>({
+    width: 820,
+    height: 500,
+  });
+  const [isDesktopViewport, setIsDesktopViewport] = useState<boolean>(() =>
+    typeof window !== "undefined" ? window.matchMedia("(min-width: 1024px)").matches : true
+  );
+  const [zoomMode, setZoomMode] = useState<"fit" | "manual">("fit");
+  const [zoomScale, setZoomScale] = useState<number>(1);
+  const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [showEInkPreview, setShowEInkPreview] = useState<boolean>(false);
+  const [spaceHeld, setSpaceHeld] = useState<boolean>(false);
+
+  // Unified Drawing, Color & Riso Halftone State
+  const [selectedRecipient, setSelectedRecipient] = useState<string>("all");
+  const [activeTool, setActiveTool] = useState<ToolMode>("pen");
+  const [brushSize, setBrushSize] = useState<number>(7);
+  const [penFeel, setPenFeel] = useState<"pen" | "pencil">("pen");
+  const [inkTexture, setInkTexture] = useState<InkTextureMode>("solid");
+  const [mainColor, setMainColor] = useState<string>("#1e1e1e");
+  const [subColor, setSubColor] = useState<string>("#e8e4d9");
+  const [selectedMixId, setSelectedMixId] = useState<string | null>(null);
+  const [eraserStyle, setEraserStyle] = useState<EraserStyle>("hard");
+  const [figureShape, setFigureShape] = useState<FigureShape>("rect");
+  const [figureFillMode, setFigureFillMode] = useState<FigureFillMode>("stroke");
+  const [fillReference, setFillReference] = useState<FillReferenceMode>("all");
+  const [ditherAlgo, setDitherAlgo] = useState<DitherAlgo>("floyd");
   const [caption, setCaption] = useState<string>("");
   const [pin, setPin] = useState<string>("");
   const [showHardwareLut, setShowHardwareLut] = useState<Record<string, boolean>>({});
   const [noteToDelete, setNoteToDelete] = useState<string | null>(null);
 
-  // Multi-Layer Canvas Scene State
+  // Tracing Sheets & Scene Layers
+  const [inkLayers, setInkLayers] = useState<InkLayerItem[]>(createDefaultInkLayers);
+  const [activeInkLayerId, setActiveInkLayerId] = useState<string>("ink-lineart");
+  const [objectsVisible, setObjectsVisible] = useState<boolean>(true);
+  const [paperVisible, setPaperVisible] = useState<boolean>(true);
+  const [photosVisible] = useState<boolean>(true);
+
   const [images, setImages] = useState<ImageLayer[]>([]);
   const [texts, setTexts] = useState<TextLayer[]>([]);
   const [stamps, setStamps] = useState<StampLayer[]>([]);
@@ -282,12 +339,13 @@ export default function App() {
   const [isCroppingImage, setIsCroppingImage] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
 
-  // Text Creator Drafts
+  // Typewriter Label Draft State
   const [draftText, setDraftText] = useState("");
   const [draftFont, setDraftFont] = useState<TextFont>("handwritten");
   const [draftBackdrop, setDraftBackdrop] = useState<TextBackdrop>("none");
+  const [draftFontSize, setDraftFontSize] = useState<number>(32);
 
-  // Interactive Overlay State
+  // Interactive Canvas Feedback
   const [hoverPoint, setHoverPoint] = useState<{ x: number; y: number } | null>(null);
   const [snapGuides, setSnapGuides] = useState<{ x: boolean; y: boolean }>({ x: false, y: false });
   const [isDrawingActive, setIsDrawingActive] = useState(false);
@@ -295,23 +353,41 @@ export default function App() {
   const [canRestoreSent, setCanRestoreSent] = useState(false);
 
   // Refs
+  const wellRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const bgCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const crispUnderlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const inkCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const objectsCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const eInkPreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const scrapbookDialogRef = useRef<HTMLDialogElement | null>(null);
   const adminDialogRef = useRef<HTMLDialogElement | null>(null);
   const deleteDialogRef = useRef<HTMLDialogElement | null>(null);
+
+  // Multi-Sheet Canvas Registry
+  const inkCanvasMapRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const inkRefCallbacksRef = useRef<Map<string, (el: HTMLCanvasElement | null) => void>>(
+    new Map()
+  );
+  const pendingRestorePixelsRef = useRef<Map<string, ImageData>>(new Map());
 
   const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const smootherRef = useRef<StrokeSmoother | null>(null);
   const isDrawingRef = useRef(false);
+  const strokeGuardRef = useRef<{
+    layerId: string;
+    preData: ImageData;
+    startTime: number;
+    startPt: { x: number; y: number };
+    maxDist: number;
+  } | null>(null);
   const shapeOriginRef = useRef<{ x: number; y: number } | null>(null);
   const shapeCurrentRef = useRef<{ x: number; y: number } | null>(null);
-  const activePointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const shapeShiftRef = useRef<boolean>(false);
+  const activePointersRef = useRef<
+    Map<number, { x: number; y: number; clientX: number; clientY: number }>
+  >(new Map());
   const gestureRef = useRef<DragGesture | null>(null);
 
   const undoStack = useRef<StudioSnapshot[]>([]);
@@ -320,15 +396,63 @@ export default function App() {
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
 
-  // Keep latest scene state in refs for synchronous callbacks & undo snapshots
   const sceneRef = useRef({
+    inkLayers,
+    activeInkLayerId,
     images,
     texts,
     stamps,
     templateId,
   });
-  sceneRef.current = { images, texts, stamps, templateId };
+  sceneRef.current = {
+    inkLayers,
+    activeInkLayerId,
+    images,
+    texts,
+    stamps,
+    templateId,
+  };
 
+  // Derived Pen / Tone Parameters
+  const effectiveBrushStyle: BrushStyle = inkTexture === "solid" ? penFeel : inkTexture;
+  const effectiveToneSubHex = selectedMixId ? subColor : null;
+
+  // Derived Viewport Scale (crisp 1:1 native max in Fit mode)
+  const fitScale = useMemo(() => {
+    const availW = Math.max(240, wellSize.width - 20);
+    const maxAvailH = isDesktopViewport
+      ? Math.max(320, (typeof window !== "undefined" ? window.innerHeight : 900) - 270)
+      : 480;
+    return clamp(Math.min(availW / CANVAS_WIDTH, maxAvailH / CANVAS_HEIGHT), 0.28, 1.0);
+  }, [wellSize.width, isDesktopViewport]);
+
+  const effectiveZoom = zoomMode === "fit" ? fitScale : zoomScale;
+
+  // Track responsive breakpoint & well width
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const onChange = (e: MediaQueryListEvent) => setIsDesktopViewport(e.matches);
+    setIsDesktopViewport(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    const el = wellRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        if (width > 0) {
+          setWellSize({ width, height: height || 480 });
+        }
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Selected Canvas Objects
   const selectedImage = useMemo(
     () =>
       selectedItem?.kind === "image"
@@ -336,7 +460,6 @@ export default function App() {
         : null,
     [images, selectedItem]
   );
-
   const selectedText = useMemo(
     () =>
       selectedItem?.kind === "text"
@@ -344,7 +467,6 @@ export default function App() {
         : null,
     [texts, selectedItem]
   );
-
   const selectedStamp = useMemo(
     () =>
       selectedItem?.kind === "stamp"
@@ -352,6 +474,40 @@ export default function App() {
         : null,
     [stamps, selectedItem]
   );
+
+  // Stable callback ref generator per tracing sheet
+  const getInkCanvasRefCallback = useCallback((layerId: string) => {
+    let cb = inkRefCallbacksRef.current.get(layerId);
+    if (!cb) {
+      cb = (el: HTMLCanvasElement | null) => {
+        if (el) {
+          inkCanvasMapRef.current.set(layerId, el);
+          const pending = pendingRestorePixelsRef.current.get(layerId);
+          if (pending) {
+            const ctx = el.getContext("2d", { willReadFrequently: true });
+            ctx?.putImageData(pending, 0, 0);
+            pendingRestorePixelsRef.current.delete(layerId);
+          }
+        } else {
+          inkCanvasMapRef.current.delete(layerId);
+        }
+      };
+      inkRefCallbacksRef.current.set(layerId, cb);
+    }
+    return cb;
+  }, []);
+
+  useLayoutEffect(() => {
+    if (pendingRestorePixelsRef.current.size === 0) return;
+    for (const [layerId, imgData] of Array.from(pendingRestorePixelsRef.current.entries())) {
+      const el = inkCanvasMapRef.current.get(layerId);
+      if (el) {
+        const ctx = el.getContext("2d", { willReadFrequently: true });
+        ctx?.putImageData(imgData, 0, 0);
+        pendingRestorePixelsRef.current.delete(layerId);
+      }
+    }
+  }, [inkLayers]);
 
   // Fetch state from server
   const fetchState = useCallback(async () => {
@@ -374,11 +530,13 @@ export default function App() {
     return () => clearInterval(interval);
   }, [fetchState]);
 
-  // Setup native dialog cancel & backdrop dismissal
+  // Setup native dialog cancel & closedby fallback light-dismiss
   useEffect(() => {
-    const dialogs = [adminDialogRef.current, deleteDialogRef.current].filter(
-      (d): d is HTMLDialogElement => d !== null
-    );
+    const dialogs = [
+      scrapbookDialogRef.current,
+      adminDialogRef.current,
+      deleteDialogRef.current,
+    ].filter((d): d is HTMLDialogElement => d !== null);
     const cleanups: Array<() => void> = [];
 
     for (const dialog of dialogs) {
@@ -390,61 +548,79 @@ export default function App() {
       cleanups.push(() => dialog.removeEventListener("cancel", handleCancel));
 
       if (!("closedBy" in HTMLDialogElement.prototype)) {
-        const isOutside = (e: PointerEvent) => {
-          const r = dialog.getBoundingClientRect();
-          return (
-            e.clientX < r.left ||
-            e.clientX > r.right ||
-            e.clientY < r.top ||
-            e.clientY > r.bottom
-          );
+        const onClickBackdrop = (event: MouseEvent) => {
+          if (event.target !== dialog) return;
+          const rect = dialog.getBoundingClientRect();
+          const isDialogContent =
+            rect.top <= event.clientY &&
+            event.clientY <= rect.top + rect.height &&
+            rect.left <= event.clientX &&
+            event.clientX <= rect.left + rect.width;
+          if (isDialogContent) return;
+          closeTopLayer(dialog);
         };
-        let pressedOutside = false;
-        const onDown = (e: PointerEvent) => {
-          pressedOutside = isOutside(e);
-        };
-        const onUp = (e: PointerEvent) => {
-          if (pressedOutside && isOutside(e)) {
-            closeTopLayer(dialog);
-          }
-        };
-        dialog.addEventListener("pointerdown", onDown);
-        dialog.addEventListener("pointerup", onUp);
-        cleanups.push(() => {
-          dialog.removeEventListener("pointerdown", onDown);
-          dialog.removeEventListener("pointerup", onUp);
-        });
+        dialog.addEventListener("click", onClickBackdrop);
+        cleanups.push(() => dialog.removeEventListener("click", onClickBackdrop));
       }
     }
 
     return () => cleanups.forEach((fn) => fn());
   }, []);
 
-  // Clone helper for snapshots
-  const cloneSnapshot = useCallback(
-    (override?: Partial<Omit<StudioSnapshot, "ink">> & { ink?: ImageData }): StudioSnapshot | null => {
-      const inkCanvas = inkCanvasRef.current;
-      if (!inkCanvas) return null;
-      const ctx = inkCanvas.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return null;
+  // Snapshot helpers
+  const readLayerImageData = useCallback((layerId: string): ImageData => {
+    const pending = pendingRestorePixelsRef.current.get(layerId);
+    if (pending) {
+      return new ImageData(new Uint8ClampedArray(pending.data), CANVAS_WIDTH, CANVAS_HEIGHT);
+    }
+    const canvas = inkCanvasMapRef.current.get(layerId);
+    const ctx = canvas?.getContext("2d", { willReadFrequently: true });
+    if (ctx) {
+      const d = ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      return new ImageData(new Uint8ClampedArray(d.data), CANVAS_WIDTH, CANVAS_HEIGHT);
+    }
+    return new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT);
+  }, []);
 
+  const cloneSnapshot = useCallback(
+    (
+      override?: Partial<Omit<StudioSnapshot, "inkLayers">> & {
+        inkLayers?: InkLayerSnapshot[];
+      }
+    ): StudioSnapshot => {
       const cur = sceneRef.current;
-      const inkData = override?.ink ?? ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      const inkSnaps: InkLayerSnapshot[] = override?.inkLayers
+        ? override.inkLayers.map((l) => ({
+            id: l.id,
+            name: l.name,
+            visible: l.visible,
+            locked: l.locked,
+            data: new ImageData(new Uint8ClampedArray(l.data.data), CANVAS_WIDTH, CANVAS_HEIGHT),
+          }))
+        : cur.inkLayers.map((l) => ({
+            ...l,
+            data: readLayerImageData(l.id),
+          }));
+
       return {
-        ink: new ImageData(new Uint8ClampedArray(inkData.data), CANVAS_WIDTH, CANVAS_HEIGHT),
+        inkLayers: inkSnaps,
+        activeInkLayerId: override?.activeInkLayerId ?? cur.activeInkLayerId,
         images: (override?.images ?? cur.images).map((i) => ({ ...i, crop: { ...i.crop } })),
         texts: (override?.texts ?? cur.texts).map((t) => ({ ...t })),
         stamps: (override?.stamps ?? cur.stamps).map((s) => ({ ...s })),
         templateId: override?.templateId ?? cur.templateId,
       };
     },
-    []
+    [readLayerImageData]
   );
 
   const pushUndoSnapshot = useCallback(
-    (override?: Partial<Omit<StudioSnapshot, "ink">> & { ink?: ImageData }) => {
+    (
+      override?: Partial<Omit<StudioSnapshot, "inkLayers">> & {
+        inkLayers?: InkLayerSnapshot[];
+      }
+    ) => {
       const snap = cloneSnapshot(override);
-      if (!snap) return;
       undoStack.current.push(snap);
       if (undoStack.current.length > MAX_UNDO) undoStack.current.shift();
       redoStack.current = [];
@@ -455,11 +631,30 @@ export default function App() {
   );
 
   const applySnapshot = useCallback((snap: StudioSnapshot) => {
-    const inkCanvas = inkCanvasRef.current;
-    if (inkCanvas) {
-      const ctx = inkCanvas.getContext("2d", { willReadFrequently: true });
-      ctx?.putImageData(snap.ink, 0, 0);
+    pendingRestorePixelsRef.current.clear();
+    for (const lSnap of snap.inkLayers) {
+      const cloned = new ImageData(
+        new Uint8ClampedArray(lSnap.data.data),
+        CANVAS_WIDTH,
+        CANVAS_HEIGHT
+      );
+      const canvas = inkCanvasMapRef.current.get(lSnap.id);
+      if (canvas) {
+        canvas.getContext("2d", { willReadFrequently: true })?.putImageData(cloned, 0, 0);
+      } else {
+        pendingRestorePixelsRef.current.set(lSnap.id, cloned);
+      }
     }
+
+    setInkLayers(
+      snap.inkLayers.map(({ id, name, visible, locked }) => ({
+        id,
+        name,
+        visible,
+        locked,
+      }))
+    );
+    setActiveInkLayerId(snap.activeInkLayerId);
     setImages(snap.images.map((i) => ({ ...i, crop: { ...i.crop } })));
     setTexts(snap.texts.map((t) => ({ ...t })));
     setStamps(snap.stamps.map((s) => ({ ...s })));
@@ -476,6 +671,7 @@ export default function App() {
     applySnapshot(previous);
     setCanUndo(undoStack.current.length > 1);
     setCanRedo(true);
+    setStatusAnnouncement("Undid last action");
   }, [applySnapshot]);
 
   const handleRedo = useCallback(() => {
@@ -485,102 +681,164 @@ export default function App() {
     applySnapshot(next);
     setCanUndo(true);
     setCanRedo(redoStack.current.length > 0);
+    setStatusAnnouncement("Redid action");
   }, [applySnapshot]);
 
-  // Initialize Canvas & Restore Local Draft on Mount
+  // Restore Local Draft on Mount (supporting multi-sheet & legacy single-layer drafts)
   useEffect(() => {
-    const inkCanvas = inkCanvasRef.current;
-    if (!inkCanvas) return;
-    const ctx = inkCanvas.getContext("2d", { willReadFrequently: true });
-    if (!ctx) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = localStorage.getItem(DRAFT_STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          const restoredImages: ImageLayer[] = Array.isArray(parsed.images) ? parsed.images : [];
+          const restoredTexts: TextLayer[] = Array.isArray(parsed.texts) ? parsed.texts : [];
+          const restoredStamps: StampLayer[] = Array.isArray(parsed.stamps) ? parsed.stamps : [];
+          const restoredTemplate: TemplateId = parsed.templateId || "blank";
 
-    ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+          if (typeof parsed.caption === "string") setCaption(parsed.caption);
+          if (parsed.ditherAlgo) setDitherAlgo(parsed.ditherAlgo);
+          if (typeof parsed.mainColor === "string") setMainColor(parsed.mainColor);
+          if (typeof parsed.subColor === "string") setSubColor(parsed.subColor);
+          if (typeof parsed.selectedMixId === "string" || parsed.selectedMixId === null) {
+            setSelectedMixId(parsed.selectedMixId);
+          }
+          if (parsed.inkTexture) setInkTexture(parsed.inkTexture);
 
-    try {
-      const raw = localStorage.getItem(DRAFT_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        const restoredImages: ImageLayer[] = Array.isArray(parsed.images) ? parsed.images : [];
-        const restoredTexts: TextLayer[] = Array.isArray(parsed.texts) ? parsed.texts : [];
-        const restoredStamps: StampLayer[] = Array.isArray(parsed.stamps) ? parsed.stamps : [];
-        const restoredTemplate: TemplateId = parsed.templateId || "blank";
+          let layerSnaps: InkLayerSnapshot[] = [];
+          let targetActiveId = "ink-lineart";
 
-        setImages(restoredImages);
-        setTexts(restoredTexts);
-        setStamps(restoredStamps);
-        setTemplateId(restoredTemplate);
-        if (typeof parsed.caption === "string") setCaption(parsed.caption);
-        if (parsed.ditherAlgo) setDitherAlgo(parsed.ditherAlgo);
-
-        if (parsed.inkDataUrl) {
-          loadImageElement(parsed.inkDataUrl)
-            .then((img) => {
-              ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-              ctx.drawImage(img, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-              const snap = cloneSnapshot({
-                images: restoredImages,
-                texts: restoredTexts,
-                stamps: restoredStamps,
-                templateId: restoredTemplate,
-              });
-              if (snap) {
-                undoStack.current = [snap];
-                setCanUndo(false);
-                setCanRedo(false);
+          if (Array.isArray(parsed.inkLayers) && parsed.inkLayers.length > 0) {
+            for (const item of parsed.inkLayers.slice(0, MAX_INK_LAYERS)) {
+              const id = typeof item.id === "string" ? item.id : makeId("ink");
+              let data = new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT);
+              if (typeof item.dataUrl === "string" && item.dataUrl.length > 0) {
+                try {
+                  data = await dataUrlToImageData(item.dataUrl);
+                } catch {
+                  // Ignore corrupt layer bitmap
+                }
               }
-            })
-            .catch(() => {
-              pushUndoSnapshot({
-                images: restoredImages,
-                texts: restoredTexts,
-                stamps: restoredStamps,
-                templateId: restoredTemplate,
+              layerSnaps.push({
+                id,
+                name: typeof item.name === "string" ? item.name : "Sheet",
+                visible: item.visible !== false,
+                locked: Boolean(item.locked),
+                data,
               });
-            });
-          return;
-        }
+            }
+            if (
+              typeof parsed.activeInkLayerId === "string" &&
+              layerSnaps.some((l) => l.id === parsed.activeInkLayerId)
+            ) {
+              targetActiveId = parsed.activeInkLayerId;
+            } else if (layerSnaps[layerSnaps.length - 1]) {
+              targetActiveId = layerSnaps[layerSnaps.length - 1].id;
+            }
+          } else if (typeof parsed.inkDataUrl === "string" && parsed.inkDataUrl.length > 0) {
+            let data = new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT);
+            try {
+              data = await dataUrlToImageData(parsed.inkDataUrl);
+            } catch {
+              // Ignore corrupt legacy draft bitmap
+            }
+            layerSnaps = [
+              {
+                id: "ink-color",
+                name: "Coloring",
+                visible: true,
+                locked: false,
+                data: new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT),
+              },
+              { id: "ink-lineart", name: "Lineart", visible: true, locked: false, data },
+            ];
+            targetActiveId = "ink-lineart";
+          }
 
-        const snap = cloneSnapshot({
-          images: restoredImages,
-          texts: restoredTexts,
-          stamps: restoredStamps,
-          templateId: restoredTemplate,
-        });
-        if (snap) {
-          undoStack.current = [snap];
-          setCanUndo(false);
+          if (cancelled) return;
+
+          if (layerSnaps.length > 0) {
+            const snap: StudioSnapshot = {
+              inkLayers: layerSnaps,
+              activeInkLayerId: targetActiveId,
+              images: restoredImages,
+              texts: restoredTexts,
+              stamps: restoredStamps,
+              templateId: restoredTemplate,
+            };
+            applySnapshot(snap);
+            undoStack.current = [cloneSnapshot(snap)];
+            setCanUndo(false);
+            setCanRedo(false);
+            return;
+          }
+
+          setImages(restoredImages);
+          setTexts(restoredTexts);
+          setStamps(restoredStamps);
+          setTemplateId(restoredTemplate);
         }
-        return;
+      } catch {
+        // Ignore malformed localStorage draft
       }
-    } catch {
-      // Ignore malformed draft
-    }
 
-    const initial = cloneSnapshot();
-    if (initial) {
-      undoStack.current = [initial];
-    }
-  }, [cloneSnapshot, pushUndoSnapshot]);
+      if (!cancelled) {
+        undoStack.current = [cloneSnapshot()];
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [applySnapshot, cloneSnapshot]);
 
   // Debounced Local Draft Persistence
   const saveDraftToStorage = useCallback(() => {
-    const inkCanvas = inkCanvasRef.current;
-    if (!inkCanvas) return;
     try {
+      const serializedLayers = inkLayers.map((l) => {
+        const c = inkCanvasMapRef.current.get(l.id);
+        let dataUrl = "";
+        if (c) {
+          dataUrl = c.toDataURL("image/png");
+        } else {
+          const pending = pendingRestorePixelsRef.current.get(l.id);
+          if (pending) dataUrl = imageDataToDataUrl(pending);
+        }
+        return { ...l, dataUrl };
+      });
       const payload = {
-        inkDataUrl: inkCanvas.toDataURL("image/png"),
+        inkLayers: serializedLayers,
+        activeInkLayerId,
         images,
         texts,
         stamps,
         templateId,
         caption,
         ditherAlgo,
+        mainColor,
+        subColor,
+        selectedMixId,
+        inkTexture,
       };
       localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(payload));
     } catch {
       // Ignore QuotaExceededError gracefully
     }
-  }, [images, texts, stamps, templateId, caption, ditherAlgo]);
+  }, [
+    inkLayers,
+    activeInkLayerId,
+    images,
+    texts,
+    stamps,
+    templateId,
+    caption,
+    ditherAlgo,
+    mainColor,
+    subColor,
+    selectedMixId,
+    inkTexture,
+  ]);
 
   useEffect(() => {
     const timer = setTimeout(saveDraftToStorage, 750);
@@ -596,9 +854,10 @@ export default function App() {
 
     ctx.fillStyle = "#e8e4d9";
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    if (!photosVisible) return;
 
     for (const layer of images) {
-      let el = imageCacheRef.current.get(layer.src);
+      const el = imageCacheRef.current.get(layer.src);
       if (!el) {
         const loadingImg = new Image();
         loadingImg.crossOrigin = "anonymous";
@@ -660,9 +919,9 @@ export default function App() {
       );
       ctx.restore();
     }
-  }, [images, imageCacheVersion]);
+  }, [images, photosVisible, imageCacheVersion]);
 
-  // Render Stationery Template & Crisp Polaroid/Stamp Photo Mats
+  // Render Stationery Template & Crisp Photo Cutout Mats
   const renderCrispUnderlay = useCallback(() => {
     const canvas = crispUnderlayCanvasRef.current;
     if (!canvas) return;
@@ -670,24 +929,26 @@ export default function App() {
     if (!ctx) return;
 
     ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-    drawStationeryTemplate(ctx, templateId);
-
-    for (const layer of images) {
-      // Clear stationery lines underneath opaque photo apertures
-      ctx.save();
-      ctx.translate(layer.x, layer.y);
-      ctx.rotate(layer.rotation);
-      ctx.scale(layer.scale, layer.scale);
-      ctx.globalCompositeOperation = "destination-out";
-      ctx.fillRect(-layer.width / 2, -layer.height / 2, layer.width, layer.height);
-      ctx.restore();
-
-      // Draw crisp un-dithered photo frame mat if Polaroid or Stamp
-      drawImageLayerFrameCrisp(ctx, layer);
+    if (paperVisible) {
+      drawStationeryTemplate(ctx, templateId);
     }
-  }, [images, templateId]);
 
-  // Render Stamps & Text Objects Layer (+ optional live drag-shape preview)
+    if (photosVisible) {
+      for (const layer of images) {
+        ctx.save();
+        ctx.translate(layer.x, layer.y);
+        ctx.rotate(layer.rotation);
+        ctx.scale(layer.scale, layer.scale);
+        ctx.globalCompositeOperation = "destination-out";
+        ctx.fillRect(-layer.width / 2, -layer.height / 2, layer.width, layer.height);
+        ctx.restore();
+
+        drawImageLayerFrameCrisp(ctx, layer);
+      }
+    }
+  }, [images, templateId, paperVisible, photosVisible]);
+
+  // Render Stamps & Text Labels (+ live shape preview)
   const renderObjectsLayer = useCallback(() => {
     const canvas = objectsCanvasRef.current;
     if (!canvas) return;
@@ -695,40 +956,53 @@ export default function App() {
     if (!ctx) return;
 
     ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-    for (const st of stamps) {
-      drawStamp(ctx, st);
-    }
-    for (const txt of texts) {
-      drawTextLayer(ctx, txt);
+
+    if (objectsVisible) {
+      for (const st of stamps) {
+        drawStamp(ctx, st);
+      }
+      for (const txt of texts) {
+        drawTextLayer(ctx, txt);
+      }
     }
 
-    if (
-      shapeOriginRef.current &&
-      shapeCurrentRef.current &&
-      activeTool === "draw" &&
-      drawMode !== "freehand" &&
-      drawMode !== "fill"
-    ) {
+    if (shapeOriginRef.current && shapeCurrentRef.current && activeTool === "figure") {
       drawShape(
         ctx,
-        drawMode,
+        figureShape,
         shapeOriginRef.current,
         shapeCurrentRef.current,
         brushSize,
-        currentColor
+        mainColor,
+        {
+          fillMode: figureFillMode,
+          shiftConstrain: shapeShiftRef.current,
+          toneStyle: inkTexture,
+          subColorHex: effectiveToneSubHex,
+        }
       );
     }
-  }, [stamps, texts, activeTool, drawMode, brushSize, currentColor]);
+  }, [
+    stamps,
+    texts,
+    objectsVisible,
+    activeTool,
+    figureShape,
+    figureFillMode,
+    brushSize,
+    mainColor,
+    inkTexture,
+    effectiveToneSubHex,
+  ]);
 
-  // Refresh Live E-Ink Quantized Preview
+  // Refresh E-Ink Quantized Peek Preview
   const refreshEInkPreview = useCallback(() => {
     if (!showEInkPreview || isDrawingRef.current) return;
     const previewCanvas = eInkPreviewCanvasRef.current;
     const bgCanvas = bgCanvasRef.current;
     const underlayCanvas = crispUnderlayCanvasRef.current;
-    const inkCanvas = inkCanvasRef.current;
     const objCanvas = objectsCanvasRef.current;
-    if (!previewCanvas || !bgCanvas || !underlayCanvas || !inkCanvas || !objCanvas) return;
+    if (!previewCanvas || !bgCanvas || !underlayCanvas || !objCanvas) return;
 
     const pCtx = previewCanvas.getContext("2d", { willReadFrequently: true });
     const bgCtx = bgCanvas.getContext("2d", { willReadFrequently: true });
@@ -741,11 +1015,17 @@ export default function App() {
     if (!mCtx) return;
 
     mCtx.drawImage(underlayCanvas, 0, 0);
-    mCtx.drawImage(inkCanvas, 0, 0);
-    mCtx.drawImage(objCanvas, 0, 0);
+    for (const layer of inkLayers) {
+      if (!layer.visible) continue;
+      const layerCanvas = inkCanvasMapRef.current.get(layer.id);
+      if (layerCanvas) mCtx.drawImage(layerCanvas, 0, 0);
+    }
+    if (objectsVisible) {
+      mCtx.drawImage(objCanvas, 0, 0);
+    }
 
     const bgRgba =
-      images.length > 0
+      photosVisible && images.length > 0
         ? bgCtx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT).data
         : null;
     const inkRgba = mCtx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT).data;
@@ -757,13 +1037,12 @@ export default function App() {
       CANVAS_HEIGHT,
       ditherAlgo
     );
-    const outImgData = new ImageData(
-      new Uint8ClampedArray(outRgba),
-      CANVAS_WIDTH,
-      CANVAS_HEIGHT
+    pCtx.putImageData(
+      new ImageData(new Uint8ClampedArray(outRgba), CANVAS_WIDTH, CANVAS_HEIGHT),
+      0,
+      0
     );
-    pCtx.putImageData(outImgData, 0, 0);
-  }, [showEInkPreview, images.length, ditherAlgo]);
+  }, [showEInkPreview, images.length, photosVisible, objectsVisible, inkLayers, ditherAlgo]);
 
   useEffect(() => {
     renderBackgroundLayer();
@@ -773,23 +1052,19 @@ export default function App() {
       refreshEInkPreview();
     }, 30);
     return () => clearTimeout(t);
-  }, [
-    renderBackgroundLayer,
-    renderCrispUnderlay,
-    renderObjectsLayer,
-    refreshEInkPreview,
-    canUndo,
-    canRedo,
-  ]);
+  }, [renderBackgroundLayer, renderCrispUnderlay, renderObjectsLayer, refreshEInkPreview, canUndo, canRedo]);
 
-  // Clear everything cleanly
+  // Clear everything cleanly -> Fresh Card with default 2-sheet stack
   const handleClearAll = useCallback(() => {
-    const inkCanvas = inkCanvasRef.current;
-    if (inkCanvas) {
-      const ctx = inkCanvas.getContext("2d", { willReadFrequently: true });
-      ctx?.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    for (const layer of sceneRef.current.inkLayers) {
+      inkCanvasMapRef.current
+        .get(layer.id)
+        ?.getContext("2d", { willReadFrequently: true })
+        ?.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
     }
-    const emptyInk = new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT);
+    const baseLayers = createDefaultInkLayers();
+    setInkLayers(baseLayers);
+    setActiveInkLayerId("ink-lineart");
     setImages([]);
     setTexts([]);
     setStamps([]);
@@ -797,15 +1072,17 @@ export default function App() {
     setSelectedItem(null);
     setIsCroppingImage(false);
     pushUndoSnapshot({
-      ink: emptyInk,
+      inkLayers: baseLayers.map((l) => ({ ...l, data: new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT) })),
+      activeInkLayerId: "ink-lineart",
       images: [],
       texts: [],
       stamps: [],
       templateId: "blank",
     });
+    setStatusAnnouncement("Started a fresh blank postcard");
   }, [pushUndoSnapshot]);
 
-  // Delete selected item
+  // Delete selected sticker / label / photo
   const handleDeleteSelected = useCallback(() => {
     if (!selectedItem) return;
     let nextImages = images;
@@ -830,9 +1107,126 @@ export default function App() {
       texts: nextTexts,
       stamps: nextStamps,
     });
+    setStatusAnnouncement("Removed selected item");
   }, [selectedItem, images, texts, stamps, pushUndoSnapshot]);
 
-  // Global keyboard shortcuts (Undo/Redo, Arrow nudge, Delete, Escape)
+  // Viewport Zoom & Pan helpers
+  const handleZoomAt = useCallback((nextZoomRaw: number) => {
+    const nextZoom = clamp(nextZoomRaw, 0.35, 3);
+    setZoomMode("manual");
+    setZoomScale(nextZoom);
+  }, []);
+
+  const handleZoomIn = useCallback(() => {
+    handleZoomAt(effectiveZoom * 1.25);
+  }, [effectiveZoom, handleZoomAt]);
+
+  const handleZoomOut = useCallback(() => {
+    handleZoomAt(effectiveZoom / 1.25);
+  }, [effectiveZoom, handleZoomAt]);
+
+  const handleZoomFit = useCallback(() => {
+    setZoomMode("fit");
+    setPanOffset({ x: 0, y: 0 });
+  }, []);
+
+  // Unified Color & Riso Halftone Handlers
+  const handleSelectPureColor = useCallback(
+    (hex: string) => {
+      if (selectedItem?.kind === "text") {
+        const next = texts.map((t) => (t.id === selectedItem.id ? { ...t, color: hex } : t));
+        setTexts(next);
+        pushUndoSnapshot({ texts: next });
+        return;
+      }
+      if (selectedItem?.kind === "stamp") {
+        const next = stamps.map((s) => (s.id === selectedItem.id ? { ...s, color: hex } : s));
+        setStamps(next);
+        pushUndoSnapshot({ stamps: next });
+        return;
+      }
+
+      setMainColor(hex);
+      if (selectedMixId !== null) {
+        setSelectedMixId(null);
+        setInkTexture("solid");
+      }
+      if (activeTool === "eraser") {
+        setActiveTool("pen");
+      }
+    },
+    [selectedItem, texts, stamps, selectedMixId, activeTool, pushUndoSnapshot]
+  );
+
+  const handleSelectOpticalMix = useCallback(
+    (swatch: OpticalMixSwatch) => {
+      setMainColor(swatch.primaryHex);
+      setSubColor(swatch.secondaryHex);
+      setSelectedMixId(swatch.id);
+      setInkTexture(swatch.density);
+      if (activeTool !== "pen" && activeTool !== "fill" && activeTool !== "figure") {
+        setActiveTool("pen");
+      }
+      setStatusAnnouncement(`Selected Riso halftone: ${swatch.label}`);
+    },
+    [activeTool]
+  );
+
+  const handleChangeInkTexture = useCallback(
+    (tex: InkTextureMode) => {
+      setInkTexture(tex);
+      if (tex === "solid" && selectedMixId !== null) {
+        setSelectedMixId(null);
+      }
+    },
+    [selectedMixId]
+  );
+
+  // Alt+Click Quick Ink Sampler
+  const sampleCanvasColorAt = useCallback(
+    (pt: { x: number; y: number }) => {
+      const px = clamp(Math.round(pt.x), 0, CANVAS_WIDTH - 1);
+      const py = clamp(Math.round(pt.y), 0, CANVAS_HEIGHT - 1);
+
+      const sampleTopLayers = (): [number, number, number] => {
+        const readPixel = (canvas: HTMLCanvasElement | null | undefined) => {
+          const ctx = canvas?.getContext("2d", { willReadFrequently: true });
+          if (!ctx) return null;
+          const d = ctx.getImageData(px, py, 1, 1).data;
+          return d[3] >= 96 ? ([d[0], d[1], d[2]] as [number, number, number]) : null;
+        };
+
+        if (objectsVisible) {
+          const obj = readPixel(objectsCanvasRef.current);
+          if (obj) return obj;
+        }
+        for (let i = inkLayers.length - 1; i >= 0; i--) {
+          const layer = inkLayers[i];
+          if (!layer.visible) continue;
+          const ink = readPixel(inkCanvasMapRef.current.get(layer.id));
+          if (ink) return ink;
+        }
+        const underlay = readPixel(crispUnderlayCanvasRef.current);
+        if (underlay) return underlay;
+        if (photosVisible && images.length > 0) {
+          const bg = readPixel(bgCanvasRef.current);
+          if (bg) return bg;
+        }
+        return [232, 228, 217];
+      };
+
+      const [r, g, b] = sampleTopLayers();
+      const sampledHex = sampleSpectraColorHex(r, g, b);
+      const name = SPECTRA_PALETTE.find((c) => c.hex === sampledHex)?.name ?? sampledHex;
+
+      setMainColor(sampledHex);
+      setSelectedMixId(null);
+      setStatusAnnouncement(`Sampled ink: ${name}`);
+    },
+    [inkLayers, objectsVisible, photosVisible, images.length]
+  );
+
+  // Keyboard Shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = document.activeElement?.tagName;
@@ -846,7 +1240,20 @@ export default function App() {
         return;
       }
 
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "y") {
+        if (isTextInput) return;
+        e.preventDefault();
+        handleRedo();
+        return;
+      }
+
       if (isTextInput) return;
+
+      if (e.code === "Space" && !e.repeat) {
+        e.preventDefault();
+        setSpaceHeld(true);
+        return;
+      }
 
       if (e.key === "Escape" && selectedItem) {
         setSelectedItem(null);
@@ -888,10 +1295,97 @@ export default function App() {
           setStamps(next);
           pushUndoSnapshot({ stamps: next });
         }
+        return;
+      }
+
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      const k = e.key.toLowerCase();
+      switch (k) {
+        case "v":
+          setActiveTool("arrange");
+          break;
+        case "p":
+        case "b":
+          setActiveTool("pen");
+          setSelectedItem(null);
+          setIsCroppingImage(false);
+          break;
+        case "e":
+          setActiveTool("eraser");
+          setSelectedItem(null);
+          setIsCroppingImage(false);
+          break;
+        case "u":
+          setActiveTool("figure");
+          setSelectedItem(null);
+          setIsCroppingImage(false);
+          break;
+        case "g":
+          setActiveTool("fill");
+          setSelectedItem(null);
+          setIsCroppingImage(false);
+          break;
+        case "t":
+          setActiveTool("text");
+          break;
+        case "s":
+          setActiveTool("stamp");
+          break;
+        case "m":
+          setActiveTool("paper");
+          setSelectedItem(null);
+          break;
+        case "0":
+          handleZoomFit();
+          break;
+        case "=":
+        case "+":
+          handleZoomIn();
+          break;
+        case "-":
+          handleZoomOut();
+          break;
+        case "[": {
+          const idx = NIB_SIZE_PRESETS.findIndex((s) => s >= brushSize);
+          const nextSize = idx > 0 ? NIB_SIZE_PRESETS[idx - 1] : NIB_SIZE_PRESETS[0];
+          setBrushSize(nextSize);
+          break;
+        }
+        case "]": {
+          const idx = NIB_SIZE_PRESETS.findIndex((s) => s > brushSize);
+          const nextSize =
+            idx >= 0 ? NIB_SIZE_PRESETS[idx] : NIB_SIZE_PRESETS[NIB_SIZE_PRESETS.length - 1];
+          setBrushSize(nextSize);
+          break;
+        }
+        case "1":
+        case "2":
+        case "3":
+        case "4":
+        case "5":
+        case "6": {
+          const entry = SPECTRA_PALETTE[Number(k) - 1];
+          if (entry) handleSelectPureColor(entry.hex);
+          break;
+        }
       }
     };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "Space") setSpaceHeld(false);
+    };
+
+    const onBlur = () => setSpaceHeld(false);
+
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
   }, [
     handleUndo,
     handleRedo,
@@ -901,9 +1395,14 @@ export default function App() {
     texts,
     stamps,
     pushUndoSnapshot,
+    handleZoomFit,
+    handleZoomIn,
+    handleZoomOut,
+    brushSize,
+    handleSelectPureColor,
   ]);
 
-  // Add multiple image files (from upload, drop, or clipboard paste)
+  // Add Multiple Photo Files
   const addImageFiles = useCallback(
     async (files: File[]) => {
       const validFiles = files.filter((f) => f.type.startsWith("image/"));
@@ -923,8 +1422,8 @@ export default function App() {
             imageCacheRef.current.set(scaled.src, decoded);
 
             const aspect = scaled.width / Math.max(1, scaled.height);
-            const maxW = existingCount === 0 && validFiles.length === 1 ? 560 : 320;
-            const maxH = existingCount === 0 && validFiles.length === 1 ? 380 : 240;
+            const maxW = existingCount === 0 && validFiles.length === 1 ? 520 : 310;
+            const maxH = existingCount === 0 && validFiles.length === 1 ? 360 : 230;
             const fitW = maxW / maxH > aspect ? maxH * aspect : maxW;
             const fitH = maxW / maxH > aspect ? maxH : maxW / aspect;
 
@@ -967,7 +1466,7 @@ export default function App() {
         pushUndoSnapshot({ images: nextImages });
       } catch (err) {
         console.error("Failed to import image:", err);
-        setErrorBanner("Could not read one of the selected images. Try PNG, JPG, or WebP.");
+        setErrorBanner("Could not read one of the selected photos. Try PNG, JPG, or WebP.");
       }
     },
     [pushUndoSnapshot]
@@ -998,11 +1497,7 @@ export default function App() {
   const clientToCanvasPt = (clientX: number, clientY: number): { x: number; y: number } => {
     const el = stageRef.current;
     if (!el) return { x: 0, y: 0 };
-    const rect = el.getBoundingClientRect();
-    return {
-      x: ((clientX - rect.left) / Math.max(1, rect.width)) * CANVAS_WIDTH,
-      y: ((clientY - rect.top) / Math.max(1, rect.height)) * CANVAS_HEIGHT,
-    };
+    return screenRectToCanvasPoint(clientX, clientY, el.getBoundingClientRect(), false);
   };
 
   // Compute TransformableBox for any selected item
@@ -1049,109 +1544,202 @@ export default function App() {
     [images, stamps, texts]
   );
 
-  // Hit-test topmost object in stage
+  // Hit-test topmost object
   const findTopObjectAtPoint = useCallback(
     (px: number, py: number): NonNullable<SelectedItem> | null => {
       const ctx = objectsCanvasRef.current?.getContext("2d");
 
-      for (let i = texts.length - 1; i >= 0; i--) {
-        const txt = texts[i];
-        if (!ctx) continue;
-        const b = measureTextLayerBounds(ctx, txt);
-        if (
-          hitTestBox(px, py, {
-            x: txt.x,
-            y: txt.y,
-            width: b.width,
-            height: b.height,
-            scale: txt.scale,
-            rotation: txt.rotation,
-          })
-        ) {
-          return { kind: "text", id: txt.id };
+      if (objectsVisible) {
+        for (let i = texts.length - 1; i >= 0; i--) {
+          const txt = texts[i];
+          if (!ctx) continue;
+          const b = measureTextLayerBounds(ctx, txt);
+          if (
+            hitTestBox(px, py, {
+              x: txt.x,
+              y: txt.y,
+              width: b.width,
+              height: b.height,
+              scale: txt.scale,
+              rotation: txt.rotation,
+            })
+          ) {
+            return { kind: "text", id: txt.id };
+          }
+        }
+
+        for (let i = stamps.length - 1; i >= 0; i--) {
+          const st = stamps[i];
+          if (
+            hitTestBox(px, py, {
+              x: st.x,
+              y: st.y,
+              width: st.size,
+              height: st.size,
+              scale: st.scale,
+              rotation: st.rotation,
+            })
+          ) {
+            return { kind: "stamp", id: st.id };
+          }
         }
       }
 
-      for (let i = stamps.length - 1; i >= 0; i--) {
-        const st = stamps[i];
-        if (
-          hitTestBox(px, py, {
-            x: st.x,
-            y: st.y,
-            width: st.size,
-            height: st.size,
-            scale: st.scale,
-            rotation: st.rotation,
-          })
-        ) {
-          return { kind: "stamp", id: st.id };
-        }
-      }
-
-      for (let i = images.length - 1; i >= 0; i--) {
-        const img = images[i];
-        if (
-          hitTestBox(px, py, {
-            x: img.x,
-            y: img.y,
-            width: img.width,
-            height: img.height,
-            scale: img.scale,
-            rotation: img.rotation,
-          })
-        ) {
-          return { kind: "image", id: img.id };
+      if (photosVisible) {
+        for (let i = images.length - 1; i >= 0; i--) {
+          const img = images[i];
+          if (
+            hitTestBox(px, py, {
+              x: img.x,
+              y: img.y,
+              width: img.width,
+              height: img.height,
+              scale: img.scale,
+              rotation: img.rotation,
+            })
+          ) {
+            return { kind: "image", id: img.id };
+          }
         }
       }
 
       return null;
     },
-    [images, stamps, texts]
+    [images, stamps, texts, objectsVisible, photosVisible]
   );
+
+  const getEditableInkContext = useCallback((): {
+    layer: InkLayerItem;
+    canvas: HTMLCanvasElement;
+    ctx: CanvasRenderingContext2D;
+  } | null => {
+    const layer = inkLayers.find((l) => l.id === activeInkLayerId) ?? inkLayers[0];
+    if (!layer) return null;
+    if (layer.locked) {
+      setStatusAnnouncement(`Sheet "${layer.name}" is locked — unlock it first to draw.`);
+      return null;
+    }
+    if (!layer.visible) {
+      setStatusAnnouncement(`Sheet "${layer.name}" is hidden — toggle its eye icon first.`);
+      return null;
+    }
+    const canvas = inkCanvasMapRef.current.get(layer.id);
+    const ctx = canvas?.getContext("2d", { willReadFrequently: true });
+    if (!canvas || !ctx) return null;
+    return { layer, canvas, ctx };
+  }, [inkLayers, activeInkLayerId]);
 
   // Unified Stage Pointer Handlers
   const handleStagePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.pointerType === "mouse" && e.button !== 0) return;
-
-    const stageEl = stageRef.current;
-    if (!stageEl) return;
-    stageEl.setPointerCapture(e.pointerId);
+    const isMiddleMouse = e.pointerType === "mouse" && e.button === 1;
+    if (e.pointerType === "mouse" && e.button !== 0 && !isMiddleMouse) return;
 
     const pt = clientToCanvasPt(e.clientX, e.clientY);
-    activePointersRef.current.set(e.pointerId, pt);
+    activePointersRef.current.set(e.pointerId, {
+      x: pt.x,
+      y: pt.y,
+      clientX: e.clientX,
+      clientY: e.clientY,
+    });
     setHoverPoint(pt);
 
-    // Two-finger touch pinch/rotate on selected layer
-    if (activePointersRef.current.size === 2 && selectedItem) {
-      const box = getBoxForItem(selectedItem);
-      if (box) {
-        const pts = Array.from(activePointersRef.current.values());
-        const dist = Math.max(10, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y));
-        const angle = Math.atan2(pts[1].y - pts[0].y, pts[1].x - pts[0].x);
-        gestureRef.current = {
-          type: "pinch",
-          item: selectedItem,
-          startDist: dist,
-          startAngle: angle,
-          startMid: { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 },
-          startCenter: { x: box.x, y: box.y },
-          startScale: box.scale,
-          startRotation: box.rotation,
-          moved: false,
-        };
-        isDrawingRef.current = false;
-        return;
+    // Capture pointers cleanly on well when zooming/panning or drawing
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+
+    // 2-finger gesture handling
+    if (activePointersRef.current.size === 2) {
+      const pts = Array.from(activePointersRef.current.values());
+
+      if (
+        selectedItem &&
+        (activeTool === "arrange" || activeTool === "text" || activeTool === "stamp")
+      ) {
+        const box = getBoxForItem(selectedItem);
+        if (box) {
+          const dist = Math.max(10, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y));
+          const angle = Math.atan2(pts[1].y - pts[0].y, pts[1].x - pts[0].x);
+          gestureRef.current = {
+            type: "pinch",
+            item: selectedItem,
+            startDist: dist,
+            startAngle: angle,
+            startMid: { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 },
+            startCenter: { x: box.x, y: box.y },
+            startScale: box.scale,
+            startRotation: box.rotation,
+            moved: false,
+          };
+          isDrawingRef.current = false;
+          return;
+        }
       }
+
+      // Cancel accidental <220ms touch-down dot before starting pinch zoom/pan
+      if (isDrawingRef.current && strokeGuardRef.current) {
+        const guard = strokeGuardRef.current;
+        if (Date.now() - guard.startTime < 220 && guard.maxDist < 12) {
+          const c = inkCanvasMapRef.current.get(guard.layerId);
+          c?.getContext("2d", { willReadFrequently: true })?.putImageData(guard.preData, 0, 0);
+        }
+        isDrawingRef.current = false;
+        setIsDrawingActive(false);
+        smootherRef.current = null;
+        strokeGuardRef.current = null;
+      }
+      shapeOriginRef.current = null;
+      shapeCurrentRef.current = null;
+
+      const dist = Math.max(
+        10,
+        Math.hypot(pts[1].clientX - pts[0].clientX, pts[1].clientY - pts[0].clientY)
+      );
+      gestureRef.current = {
+        type: "viewport-pinch",
+        startDist: dist,
+        startMidClient: {
+          x: (pts[0].clientX + pts[1].clientX) / 2,
+          y: (pts[0].clientY + pts[1].clientY) / 2,
+        },
+        startZoom: effectiveZoom,
+        startPan: panOffset,
+      };
+      return;
     }
 
-    // Object selection / transform handles when not actively drawing/erasing
-    const canInteractWithObjects =
-      activeTool === "arrange" ||
-      activeTool === "text" ||
-      activeTool === "stamp" ||
-      selectedItem !== null;
+    // Space+Drag or Middle-Mouse Pan
+    if (spaceHeld || isMiddleMouse) {
+      if (zoomMode === "fit") {
+        setZoomScale(fitScale);
+        setZoomMode("manual");
+      }
+      gestureRef.current = {
+        type: "viewport-pan",
+        startClient: { x: e.clientX, y: e.clientY },
+        startPan: panOffset,
+      };
+      return;
+    }
 
-    if (canInteractWithObjects && activeTool !== "draw" && activeTool !== "eraser") {
+    // Alt+Click Quick Sampler
+    if (e.altKey) {
+      sampleCanvasColorAt(pt);
+      return;
+    }
+
+    // Object Interaction (Photos, Stamps, Labels)
+    const isRasterTool =
+      activeTool === "pen" ||
+      activeTool === "eraser" ||
+      activeTool === "figure" ||
+      activeTool === "fill";
+    const canInteractWithObjects =
+      !isRasterTool &&
+      (activeTool === "arrange" ||
+        activeTool === "text" ||
+        activeTool === "stamp" ||
+        selectedItem !== null);
+
+    if (canInteractWithObjects) {
       if (selectedItem) {
         const currentBox = getBoxForItem(selectedItem);
         if (currentBox) {
@@ -1200,12 +1788,9 @@ export default function App() {
             item: hit,
             startPt: pt,
             startBox: box,
-            startImage:
-              hit.kind === "image" ? images.find((i) => i.id === hit.id) : undefined,
-            startText:
-              hit.kind === "text" ? texts.find((t) => t.id === hit.id) : undefined,
-            startStamp:
-              hit.kind === "stamp" ? stamps.find((s) => s.id === hit.id) : undefined,
+            startImage: hit.kind === "image" ? images.find((i) => i.id === hit.id) : undefined,
+            startText: hit.kind === "text" ? texts.find((t) => t.id === hit.id) : undefined,
+            startStamp: hit.kind === "stamp" ? stamps.find((s) => s.id === hit.id) : undefined,
             moved: false,
           };
         }
@@ -1217,22 +1802,41 @@ export default function App() {
       return;
     }
 
-    // Drawing / Erasing modes on inkCanvas
-    if (activeTool === "draw" || activeTool === "eraser") {
+    // Raster tools on active Tracing Sheet
+    if (isRasterTool) {
       setSelectedItem(null);
       setIsCroppingImage(false);
-      const inkCanvas = inkCanvasRef.current;
-      const inkCtx = inkCanvas?.getContext("2d", { willReadFrequently: true });
-      if (!inkCanvas || !inkCtx) return;
 
-      if (activeTool === "draw" && drawMode === "fill") {
+      const target = getEditableInkContext();
+      if (!target) return;
+      const { layer, ctx: inkCtx } = target;
+
+      // 1. Paint Bucket (respects Lineart & all visible sheets by default)
+      if (activeTool === "fill") {
         const inkImgData = inkCtx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-        const underlayCtx = crispUnderlayCanvasRef.current?.getContext("2d", {
-          willReadFrequently: true,
-        });
-        const boundary = underlayCtx
-          ? underlayCtx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT).data
-          : undefined;
+
+        let boundary: Uint8ClampedArray | undefined;
+        if (fillReference === "all") {
+          const buffers: Array<Uint8ClampedArray | null> = [];
+          const underlayCtx = crispUnderlayCanvasRef.current?.getContext("2d", {
+            willReadFrequently: true,
+          });
+          if (underlayCtx && paperVisible) {
+            buffers.push(underlayCtx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT).data);
+          }
+          for (const l of inkLayers) {
+            if (!l.visible || l.id === layer.id) continue;
+            const lc = inkCanvasMapRef.current.get(l.id);
+            const lctx = lc?.getContext("2d", { willReadFrequently: true });
+            if (lctx) {
+              buffers.push(lctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT).data);
+            }
+          }
+          boundary = mergeBoundaryBuffers(buffers);
+        }
+
+        const fillRgba = hexToRgba(mainColor);
+        const secondaryRgba = effectiveToneSubHex ? hexToRgba(effectiveToneSubHex) : null;
 
         const changed = floodFillBuffer(
           inkImgData.data,
@@ -1240,30 +1844,47 @@ export default function App() {
           CANVAS_HEIGHT,
           pt.x,
           pt.y,
-          hexToRgba(currentColor),
-          boundary
+          fillRgba,
+          boundary,
+          { mode: inkTexture, secondaryRgba }
         );
         if (changed) {
           inkCtx.putImageData(inkImgData, 0, 0);
           pushUndoSnapshot();
+          setTimeout(() => refreshEInkPreview(), 0);
         }
         return;
       }
 
-      if (activeTool === "draw" && drawMode !== "freehand") {
+      // 2. Shape Stencil drag
+      if (activeTool === "figure") {
         isDrawingRef.current = true;
         setIsDrawingActive(true);
         shapeOriginRef.current = pt;
         shapeCurrentRef.current = pt;
+        shapeShiftRef.current = e.shiftKey;
         renderObjectsLayer();
         return;
       }
 
-      // Freehand Pen / Marker / Calligraphy / Halftone / Eraser
+      // 3. Freehand Pen or Eraser
+      const isErasing = activeTool === "eraser";
+      const strokeStyle: BrushStyle | "eraser" = isErasing ? "eraser" : effectiveBrushStyle;
+      const preData = inkCtx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      strokeGuardRef.current = {
+        layerId: layer.id,
+        preData: new ImageData(new Uint8ClampedArray(preData.data), CANVAS_WIDTH, CANVAS_HEIGHT),
+        startTime: Date.now(),
+        startPt: pt,
+        maxDist: 0,
+      };
+
       isDrawingRef.current = true;
       setIsDrawingActive(true);
-      const effectiveStyle = activeTool === "eraser" ? "eraser" : brushStyle;
-      const smoother = new StrokeSmoother(brushSize, effectiveStyle);
+      const smoother = new StrokeSmoother(brushSize, strokeStyle, {
+        stabilization: 2,
+        taper: true,
+      });
       smootherRef.current = smoother;
       const startStamps = smoother.startStroke({
         x: pt.x,
@@ -1272,13 +1893,10 @@ export default function App() {
         pressure: e.pressure,
         pointerType: e.pointerType,
       });
-      renderStampsToContext(
-        inkCtx,
-        startStamps,
-        effectiveStyle,
-        currentColor,
-        activeTool === "eraser"
-      );
+      renderStampsToContext(inkCtx, startStamps, strokeStyle, mainColor, isErasing, {
+        subColorHex: effectiveToneSubHex,
+        eraserStyle: isErasing ? eraserStyle : "hard",
+      });
     }
   };
 
@@ -1287,11 +1905,48 @@ export default function App() {
     setHoverPoint(pt);
 
     if (activePointersRef.current.has(e.pointerId)) {
-      activePointersRef.current.set(e.pointerId, pt);
+      activePointersRef.current.set(e.pointerId, {
+        x: pt.x,
+        y: pt.y,
+        clientX: e.clientX,
+        clientY: e.clientY,
+      });
     }
 
-    // Pinch / two-finger gesture
     const gesture = gestureRef.current;
+
+    if (gesture && gesture.type === "viewport-pan") {
+      setPanOffset({
+        x: gesture.startPan.x + (e.clientX - gesture.startClient.x),
+        y: gesture.startPan.y + (e.clientY - gesture.startClient.y),
+      });
+      return;
+    }
+
+    if (
+      gesture &&
+      gesture.type === "viewport-pinch" &&
+      activePointersRef.current.size >= 2
+    ) {
+      const pts = Array.from(activePointersRef.current.values());
+      const dist = Math.max(
+        10,
+        Math.hypot(pts[1].clientX - pts[0].clientX, pts[1].clientY - pts[0].clientY)
+      );
+      const mid = {
+        x: (pts[0].clientX + pts[1].clientX) / 2,
+        y: (pts[0].clientY + pts[1].clientY) / 2,
+      };
+      const nextZoom = clamp(gesture.startZoom * (dist / gesture.startDist), 0.35, 3);
+      setZoomMode("manual");
+      setZoomScale(nextZoom);
+      setPanOffset({
+        x: gesture.startPan.x + (mid.x - gesture.startMidClient.x),
+        y: gesture.startPan.y + (mid.y - gesture.startMidClient.y),
+      });
+      return;
+    }
+
     if (gesture && gesture.type === "pinch" && activePointersRef.current.size >= 2) {
       const pts = Array.from(activePointersRef.current.values());
       const dist = Math.max(10, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y));
@@ -1332,7 +1987,6 @@ export default function App() {
       return;
     }
 
-    // Single-pointer transform gesture
     if (gesture && gesture.type === "transform") {
       gesture.moved = true;
       const { handle, startBox, startPt, item } = gesture;
@@ -1378,12 +2032,7 @@ export default function App() {
         return;
       }
 
-      if (
-        handle === "nw" ||
-        handle === "ne" ||
-        handle === "se" ||
-        handle === "sw"
-      ) {
+      if (handle === "nw" || handle === "ne" || handle === "se" || handle === "sw") {
         const initDist = Math.max(8, Math.hypot(startPt.x - startBox.x, startPt.y - startBox.y));
         const currDist = Math.max(4, Math.hypot(pt.x - startBox.x, pt.y - startBox.y));
         const nextScale = clamp(startBox.scale * (currDist / initDist), 0.15, 6);
@@ -1404,7 +2053,6 @@ export default function App() {
         return;
       }
 
-      // Interactive Crop Edge Handles for ImageLayer
       if (handle.startsWith("crop-") && item.kind === "image" && gesture.startImage) {
         const initImg = gesture.startImage;
         const localStart = worldToLocal(startPt.x, startPt.y, startBox);
@@ -1428,11 +2076,7 @@ export default function App() {
           nw = initImg.crop.w + dw;
           localShiftX = ((nw - initImg.crop.w) / initImg.crop.w) * (initImg.width / 2);
         } else if (handle === "crop-w") {
-          const dxCrop = clamp(
-            fracDx * initImg.crop.w,
-            -initImg.crop.x,
-            initImg.crop.w - 0.15
-          );
+          const dxCrop = clamp(fracDx * initImg.crop.w, -initImg.crop.x, initImg.crop.w - 0.15);
           nx = initImg.crop.x + dxCrop;
           nw = initImg.crop.w - dxCrop;
           localShiftX = (dxCrop / initImg.crop.w) * (initImg.width / 2);
@@ -1445,11 +2089,7 @@ export default function App() {
           nh = initImg.crop.h + dh;
           localShiftY = ((nh - initImg.crop.h) / initImg.crop.h) * (initImg.height / 2);
         } else if (handle === "crop-n") {
-          const dyCrop = clamp(
-            fracDy * initImg.crop.h,
-            -initImg.crop.y,
-            initImg.crop.h - 0.15
-          );
+          const dyCrop = clamp(fracDy * initImg.crop.h, -initImg.crop.y, initImg.crop.h - 0.15);
           ny = initImg.crop.y + dyCrop;
           nh = initImg.crop.h - dyCrop;
           localShiftY = (dyCrop / initImg.crop.h) * (initImg.height / 2);
@@ -1482,26 +2122,35 @@ export default function App() {
       }
     }
 
-    // Active Shape Preview
-    if (isDrawingRef.current && shapeOriginRef.current && drawMode !== "freehand" && drawMode !== "fill") {
+    if (isDrawingRef.current && shapeOriginRef.current && activeTool === "figure") {
       shapeCurrentRef.current = pt;
+      shapeShiftRef.current = e.shiftKey;
       renderObjectsLayer();
       return;
     }
 
-    // Active Freehand Drawing with Coalesced Events (eliminates gaps on fast motion!)
     if (!isDrawingRef.current || !smootherRef.current) return;
-    const inkCanvas = inkCanvasRef.current;
+    const inkCanvas = inkCanvasMapRef.current.get(activeInkLayerId);
     const inkCtx = inkCanvas?.getContext("2d", { willReadFrequently: true });
     if (!inkCanvas || !inkCtx) return;
+
+    if (strokeGuardRef.current) {
+      const d = Math.hypot(
+        pt.x - strokeGuardRef.current.startPt.x,
+        pt.y - strokeGuardRef.current.startPt.y
+      );
+      if (d > strokeGuardRef.current.maxDist) strokeGuardRef.current.maxDist = d;
+    }
 
     const native = e.nativeEvent;
     const coalesced =
       typeof native.getCoalescedEvents === "function" ? native.getCoalescedEvents() : [];
     const eventsToProcess = coalesced.length > 0 ? coalesced : [native];
 
-    const effectiveStyle = activeTool === "eraser" ? "eraser" : brushStyle;
+    const isErasing = activeTool === "eraser";
+    const strokeStyle: BrushStyle | "eraser" = isErasing ? "eraser" : effectiveBrushStyle;
     const allStamps = [];
+
     for (const cev of eventsToProcess) {
       const cpt = clientToCanvasPt(cev.clientX, cev.clientY);
       const inputPt: StrokeInputPoint = {
@@ -1518,63 +2167,67 @@ export default function App() {
     }
 
     if (allStamps.length > 0) {
-      renderStampsToContext(
-        inkCtx,
-        allStamps,
-        effectiveStyle,
-        currentColor,
-        activeTool === "eraser"
-      );
+      renderStampsToContext(inkCtx, allStamps, strokeStyle, mainColor, isErasing, {
+        subColorHex: effectiveToneSubHex,
+        eraserStyle: isErasing ? eraserStyle : "hard",
+      });
     }
   };
 
   const handleStagePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     activePointersRef.current.delete(e.pointerId);
     setSnapGuides({ x: false, y: false });
+    strokeGuardRef.current = null;
 
-    if (gestureRef.current) {
-      const wasMoved = gestureRef.current.moved;
-      gestureRef.current = null;
-      if (wasMoved) {
-        pushUndoSnapshot();
+    const gesture = gestureRef.current;
+    if (gesture) {
+      if (gesture.type === "viewport-pan" || gesture.type === "viewport-pinch") {
+        gestureRef.current = null;
+        return;
       }
+      const wasMoved = gesture.moved;
+      gestureRef.current = null;
+      if (wasMoved) pushUndoSnapshot();
       return;
     }
 
     if (!isDrawingRef.current) return;
 
-    const inkCanvas = inkCanvasRef.current;
+    const inkCanvas = inkCanvasMapRef.current.get(activeInkLayerId);
     const inkCtx = inkCanvas?.getContext("2d", { willReadFrequently: true });
 
     if (
       shapeOriginRef.current &&
       shapeCurrentRef.current &&
-      activeTool === "draw" &&
-      drawMode !== "freehand" &&
-      drawMode !== "fill" &&
+      activeTool === "figure" &&
       inkCtx
     ) {
       drawShape(
         inkCtx,
-        drawMode,
+        figureShape,
         shapeOriginRef.current,
         shapeCurrentRef.current,
         brushSize,
-        currentColor
+        mainColor,
+        {
+          fillMode: figureFillMode,
+          shiftConstrain: shapeShiftRef.current,
+          toneStyle: inkTexture,
+          subColorHex: effectiveToneSubHex,
+        }
       );
       shapeOriginRef.current = null;
       shapeCurrentRef.current = null;
       renderObjectsLayer();
     } else if (smootherRef.current && inkCtx) {
+      const isErasing = activeTool === "eraser";
+      const strokeStyle: BrushStyle | "eraser" = isErasing ? "eraser" : effectiveBrushStyle;
       const endStamps = smootherRef.current.finishStroke();
       if (endStamps.length > 0) {
-        renderStampsToContext(
-          inkCtx,
-          endStamps,
-          activeTool === "eraser" ? "eraser" : brushStyle,
-          currentColor,
-          activeTool === "eraser"
-        );
+        renderStampsToContext(inkCtx, endStamps, strokeStyle, mainColor, isErasing, {
+          subColorHex: effectiveToneSubHex,
+          eraserStyle: isErasing ? eraserStyle : "hard",
+        });
       }
       smootherRef.current = null;
     }
@@ -1598,32 +2251,131 @@ export default function App() {
     }
   };
 
-  // Color pot click handler (recolors selected text/stamp, or switches brush color & resumes draw)
-  const handleSelectColorPot = (hex: string) => {
-    setCurrentColor(hex);
-    if (selectedItem?.kind === "text") {
-      const next = texts.map((t) => (t.id === selectedItem.id ? { ...t, color: hex } : t));
-      setTexts(next);
-      pushUndoSnapshot({ texts: next });
-      return;
-    }
-    if (selectedItem?.kind === "stamp") {
-      const next = stamps.map((s) => (s.id === selectedItem.id ? { ...s, color: hex } : s));
-      setStamps(next);
-      pushUndoSnapshot({ stamps: next });
-      return;
-    }
-    if (activeTool === "eraser") {
-      setActiveTool("draw");
-    }
+  // Tracing Sheet Operations (Up to 4 Sheets)
+  const handleAddInkLayer = () => {
+    if (inkLayers.length >= MAX_INK_LAYERS) return;
+    const newId = makeId("ink");
+    const newLayer: InkLayerItem = {
+      id: newId,
+      name: `Sheet ${inkLayers.length + 1}`,
+      visible: true,
+      locked: false,
+    };
+    const idx = inkLayers.findIndex((l) => l.id === activeInkLayerId);
+    const insertAt = idx >= 0 ? idx + 1 : inkLayers.length;
+    const next = [...inkLayers];
+    next.splice(insertAt, 0, newLayer);
+
+    const snaps: InkLayerSnapshot[] = next.map((l) => ({
+      ...l,
+      data:
+        l.id === newId
+          ? new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT)
+          : readLayerImageData(l.id),
+    }));
+
+    setInkLayers(next);
+    setActiveInkLayerId(newId);
+    pushUndoSnapshot({ inkLayers: snaps, activeInkLayerId: newId });
+    setStatusAnnouncement(`Added ${newLayer.name}`);
   };
 
-  // Image toolbar actions
-  const handleUpdateImage = (
-    id: string,
-    patch: Partial<ImageLayer>,
-    recordUndo = false
-  ) => {
+  const handleMergeDownInkLayer = () => {
+    const idx = inkLayers.findIndex((l) => l.id === activeInkLayerId);
+    if (idx <= 0) return;
+    const top = inkLayers[idx];
+    const below = inkLayers[idx - 1];
+    if (top.locked || below.locked) {
+      setStatusAnnouncement("Unlock both sheets before merging.");
+      return;
+    }
+
+    const topCanvas = inkCanvasMapRef.current.get(top.id);
+    const belowCanvas = inkCanvasMapRef.current.get(below.id);
+    const belowCtx = belowCanvas?.getContext("2d", { willReadFrequently: true });
+    if (topCanvas && belowCtx) {
+      belowCtx.drawImage(topCanvas, 0, 0);
+    }
+
+    const next = inkLayers.filter((l) => l.id !== top.id);
+    const snaps: InkLayerSnapshot[] = next.map((l) => ({
+      ...l,
+      data: readLayerImageData(l.id),
+    }));
+
+    setInkLayers(next);
+    setActiveInkLayerId(below.id);
+    pushUndoSnapshot({ inkLayers: snaps, activeInkLayerId: below.id });
+    setStatusAnnouncement(`Combined ${top.name} onto ${below.name}`);
+  };
+
+  const handleMoveInkLayer = (dir: "up" | "down") => {
+    const idx = inkLayers.findIndex((l) => l.id === activeInkLayerId);
+    if (idx === -1) return;
+    const target = dir === "up" ? idx + 1 : idx - 1;
+    if (target < 0 || target >= inkLayers.length) return;
+    const next = [...inkLayers];
+    const [moved] = next.splice(idx, 1);
+    next.splice(target, 0, moved);
+    setInkLayers(next);
+    const snaps: InkLayerSnapshot[] = next.map((l) => ({
+      ...l,
+      data: readLayerImageData(l.id),
+    }));
+    pushUndoSnapshot({ inkLayers: snaps });
+  };
+
+  const handleClearActiveInkLayer = () => {
+    const layer = inkLayers.find((l) => l.id === activeInkLayerId);
+    if (!layer) return;
+    if (layer.locked) {
+      setStatusAnnouncement(`Sheet "${layer.name}" is locked.`);
+      return;
+    }
+    const c = inkCanvasMapRef.current.get(layer.id);
+    c?.getContext("2d", { willReadFrequently: true })?.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    pushUndoSnapshot();
+    setTimeout(() => refreshEInkPreview(), 0);
+    setStatusAnnouncement(`Wiped ${layer.name} clean`);
+  };
+
+  const handleDeleteActiveInkLayer = () => {
+    if (inkLayers.length <= 1) return;
+    const idx = inkLayers.findIndex((l) => l.id === activeInkLayerId);
+    if (idx === -1) return;
+    const removed = inkLayers[idx];
+    const next = inkLayers.filter((l) => l.id !== removed.id);
+    const nextActive = next[Math.max(0, idx - 1)]?.id ?? next[0].id;
+    const snaps: InkLayerSnapshot[] = next.map((l) => ({
+      ...l,
+      data: readLayerImageData(l.id),
+    }));
+    setInkLayers(next);
+    setActiveInkLayerId(nextActive);
+    pushUndoSnapshot({ inkLayers: snaps, activeInkLayerId: nextActive });
+    setStatusAnnouncement(`Tossed ${removed.name}`);
+  };
+
+  const handleToggleInkLayerVisible = (id: string) => {
+    setInkLayers((prev) => prev.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)));
+  };
+
+  const handleToggleInkLayerLocked = (id: string) => {
+    setInkLayers((prev) => prev.map((l) => (l.id === id ? { ...l, locked: !l.locked } : l)));
+  };
+
+  const handleRenameInkLayer = (id: string, name: string) => {
+    const next = inkLayers.map((l) => (l.id === id ? { ...l, name } : l));
+    setInkLayers(next);
+    const snaps: InkLayerSnapshot[] = next.map((l) => ({
+      ...l,
+      data: readLayerImageData(l.id),
+    }));
+    pushUndoSnapshot({ inkLayers: snaps });
+  };
+
+  // Image Cutout Actions
+  const handleUpdateImage = (id: string, patch: Partial<ImageLayer>, recordUndo = false) => {
     const next = images.map((img) => (img.id === id ? { ...img, ...patch } : img));
     setImages(next);
     if (recordUndo) {
@@ -1679,40 +2431,6 @@ export default function App() {
     pushUndoSnapshot({ images: next });
   };
 
-  const handleFillCanvasImage = (id: string) => {
-    const next = images.map((img) => {
-      if (img.id !== id) return img;
-      const aspect =
-        (img.naturalWidth * img.crop.w) / Math.max(1, img.naturalHeight * img.crop.h);
-      const w = CANVAS_WIDTH / CANVAS_HEIGHT > aspect ? CANVAS_WIDTH : CANVAS_HEIGHT * aspect;
-      const h = CANVAS_WIDTH / CANVAS_HEIGHT > aspect ? CANVAS_WIDTH / aspect : CANVAS_HEIGHT;
-      return {
-        ...img,
-        x: CANVAS_WIDTH / 2,
-        y: CANVAS_HEIGHT / 2,
-        width: w,
-        height: h,
-        scale: 1,
-        rotation: 0,
-        frameStyle: "none" as const,
-      };
-    });
-    setImages(next);
-    pushUndoSnapshot({ images: next });
-  };
-
-  const handleReorderImage = (id: string, dir: "forward" | "backward") => {
-    const idx = images.findIndex((i) => i.id === id);
-    if (idx === -1) return;
-    const target = dir === "forward" ? idx + 1 : idx - 1;
-    if (target < 0 || target >= images.length) return;
-    const next = [...images];
-    const [moved] = next.splice(idx, 1);
-    next.splice(target, 0, moved);
-    setImages(next);
-    pushUndoSnapshot({ images: next });
-  };
-
   const handleDuplicateImage = (id: string) => {
     const src = images.find((i) => i.id === id);
     if (!src) return;
@@ -1729,24 +2447,25 @@ export default function App() {
     pushUndoSnapshot({ images: next });
   };
 
-  // Text toolbar actions
-  const handleAddNewText = (initialText?: string) => {
-    const content = (initialText ?? draftText).trim() || "Love note!";
+  // Label Actions
+  const handleAddNewText = () => {
+    const content = draftText.trim() || "Love note!";
     const offset = (texts.length % 4) * 20;
     const layer: TextLayer = {
       id: makeId("txt"),
       text: content,
       x: CANVAS_WIDTH / 2 + offset,
       y: CANVAS_HEIGHT / 2 + offset,
-      fontSize: 32,
+      fontSize: draftFontSize,
       scale: 1,
       rotation: 0,
-      color: currentColor,
+      color: mainColor,
       font: draftFont,
       backdrop: draftBackdrop,
     };
     const next = [...texts, layer];
     setTexts(next);
+    setObjectsVisible(true);
     setDraftText("");
     setSelectedItem({ kind: "text", id: layer.id });
     pushUndoSnapshot({ texts: next });
@@ -1756,7 +2475,6 @@ export default function App() {
     if (selectedText) {
       const next = texts.map((t) => (t.id === selectedText.id ? { ...t, text: val } : t));
       setTexts(next);
-      // Avoid flooding undo stack on every keystroke; draft persists via autosave
     } else {
       setDraftText(val);
     }
@@ -1780,7 +2498,16 @@ export default function App() {
     }
   };
 
-  // Stamp placement
+  const handleChangeDraftFontSize = (size: number, commit = false) => {
+    setDraftFontSize(size);
+    if (selectedText) {
+      const next = texts.map((t) => (t.id === selectedText.id ? { ...t, fontSize: size } : t));
+      setTexts(next);
+      if (commit) pushUndoSnapshot({ texts: next });
+    }
+  };
+
+  // Rubber Stamp Actions
   const handlePlaceStamp = (stampId: StampId) => {
     const offset = (stamps.length % 5) * 26 - 40;
     const layer: StampLayer = {
@@ -1791,10 +2518,11 @@ export default function App() {
       size: 76,
       scale: 1,
       rotation: 0,
-      color: currentColor,
+      color: mainColor,
     };
     const next = [...stamps, layer];
     setStamps(next);
+    setObjectsVisible(true);
     setSelectedItem({ kind: "stamp", id: layer.id });
     pushUndoSnapshot({ stamps: next });
   };
@@ -1808,13 +2536,21 @@ export default function App() {
     pushUndoSnapshot({ stamps: next });
   };
 
-  // Stationery change
+  const handleScaleSelectedStamp = (scale: number, commit = false) => {
+    if (!selectedStamp) return;
+    const next = stamps.map((s) => (s.id === selectedStamp.id ? { ...s, scale } : s));
+    setStamps(next);
+    if (commit) pushUndoSnapshot({ stamps: next });
+  };
+
+  // Stationery Change
   const handleChangeTemplate = (id: TemplateId) => {
+    setPaperVisible(true);
     setTemplateId(id);
     pushUndoSnapshot({ templateId: id });
   };
 
-  // Build composite ink PNG data URL for export
+  // Build Composite Ink PNG Data URL
   const buildCompositeInkDataUrl = (): string => {
     const merged = document.createElement("canvas");
     merged.width = CANVAS_WIDTH;
@@ -1823,19 +2559,25 @@ export default function App() {
     if (!ctx) return "";
 
     if (crispUnderlayCanvasRef.current) ctx.drawImage(crispUnderlayCanvasRef.current, 0, 0);
-    if (inkCanvasRef.current) ctx.drawImage(inkCanvasRef.current, 0, 0);
-    if (objectsCanvasRef.current) ctx.drawImage(objectsCanvasRef.current, 0, 0);
+    for (const layer of inkLayers) {
+      if (!layer.visible) continue;
+      const layerCanvas = inkCanvasMapRef.current.get(layer.id);
+      if (layerCanvas) ctx.drawImage(layerCanvas, 0, 0);
+    }
+    if (objectsVisible && objectsCanvasRef.current) {
+      ctx.drawImage(objectsCanvasRef.current, 0, 0);
+    }
     return merged.toDataURL("image/png");
   };
 
-  // Send Note to Frame(s)
+  // Send Postcard to Frame(s)
   const handleSendNote = async () => {
     setErrorBanner(null);
     setIsSending(true);
     try {
       const preSend = cloneSnapshot();
       const backgroundDataUrl =
-        images.length > 0 && bgCanvasRef.current
+        photosVisible && images.length > 0 && bgCanvasRef.current
           ? bgCanvasRef.current.toDataURL("image/png")
           : null;
       const inkDataUrl = buildCompositeInkDataUrl();
@@ -1863,24 +2605,27 @@ export default function App() {
       });
 
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: "Failed to beam note" }));
-        setErrorBanner(err.error || "Failed to beam postcard. Check PIN or connection.");
+        const err = await res.json().catch(() => ({ error: "Failed to send postcard" }));
+        setErrorBanner(err.error || "Failed to send postcard. Check PIN or connection.");
         return;
       }
 
       const result = await res.json();
       await fetchState();
 
-      if (preSend) {
-        preSendSnapshotRef.current = preSend;
-        setCanRestoreSent(true);
-      }
+      preSendSnapshotRef.current = preSend;
+      setCanRestoreSent(true);
 
-      // Reset studio cleanly for next note
-      const inkCanvas = inkCanvasRef.current;
-      if (inkCanvas) {
-        inkCanvas.getContext("2d", { willReadFrequently: true })?.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      // Reset desk cleanly for the next postcard
+      for (const layer of sceneRef.current.inkLayers) {
+        inkCanvasMapRef.current
+          .get(layer.id)
+          ?.getContext("2d", { willReadFrequently: true })
+          ?.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
       }
+      const baseLayers = createDefaultInkLayers();
+      setInkLayers(baseLayers);
+      setActiveInkLayerId("ink-lineart");
       setImages([]);
       setTexts([]);
       setStamps([]);
@@ -1894,7 +2639,8 @@ export default function App() {
         // Ignore storage error
       }
       pushUndoSnapshot({
-        ink: new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT),
+        inkLayers: baseLayers.map((l) => ({ ...l, data: new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT) })),
+        activeInkLayerId: "ink-lineart",
         images: [],
         texts: [],
         stamps: [],
@@ -1919,15 +2665,15 @@ export default function App() {
 
       const wakeText =
         minWake === null
-          ? "Press KEY on the frame for instant refresh, or wait for its ~15m wake cycle."
+          ? "Press KEY on the frame for an instant refresh, or wait for the ~15m wake cycle."
           : minWake === 0
-          ? "Frame wake-up is due now (or press KEY on frame for instant refresh)."
-          : `Next wake in ~${minWake}m (or press KEY on frame for instant refresh).`;
+          ? "Frame wake-up is due now (or press KEY for instant refresh)."
+          : `Next wake in ~${minWake}m (or press KEY for instant refresh).`;
 
-      setSendSuccessBanner(`Postcard queued for ${targetLabel}! ✨ ${wakeText}`);
+      setSendSuccessBanner(`Postcard mailed to ${targetLabel}! ${wakeText}`);
     } catch (err) {
       console.error("Send note error:", err);
-      setErrorBanner("Network error while beaming postcard to server.");
+      setErrorBanner("Network error while sending postcard to server.");
     } finally {
       setIsSending(false);
     }
@@ -1941,7 +2687,7 @@ export default function App() {
     setSendSuccessBanner(null);
   };
 
-  // Re-send Note (targets currently selected recipient pill!)
+  // Re-send Note
   const handleResend = async (noteId: string) => {
     setErrorBanner(null);
     try {
@@ -1955,23 +2701,23 @@ export default function App() {
       });
 
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: "Failed to re-send postcard" }));
-        setErrorBanner(err.error || "Invalid PIN or failed to re-send postcard.");
+        const err = await res.json().catch(() => ({ error: "Failed to send postcard again" }));
+        setErrorBanner(err.error || "Invalid PIN or failed to send postcard again.");
         return;
       }
 
       await fetchState();
       setCanRestoreSent(false);
       setSendSuccessBanner(
-        `Postcard queued again for ${formatRecipientFriendly(selectedRecipient)}! ✨ Press KEY on frame or wait for next wake cycle.`
+        `Postcard queued again for ${formatRecipientFriendly(selectedRecipient)}!`
       );
     } catch (err) {
       console.error("Resend error:", err);
-      setErrorBanner("Failed to re-send postcard.");
+      setErrorBanner("Failed to send postcard again.");
     }
   };
 
-  // Remix / Reply: loads note preview onto canvas at 1:1 with zero re-dither drift
+  // Remix Reply onto Coloring + Reply Ink sheets above postcard
   const handleRemixNote = async (noteId: string) => {
     setErrorBanner(null);
     try {
@@ -1997,32 +2743,44 @@ export default function App() {
         crop: { x: 0, y: 0, w: 1, h: 1 },
       };
 
-      const inkCanvas = inkCanvasRef.current;
-      if (inkCanvas) {
-        inkCanvas.getContext("2d", { willReadFrequently: true })?.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      for (const layer of sceneRef.current.inkLayers) {
+        inkCanvasMapRef.current
+          .get(layer.id)
+          ?.getContext("2d", { willReadFrequently: true })
+          ?.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
       }
 
+      const remixSheets: InkLayerItem[] = [
+        { id: "ink-color", name: "Coloring", visible: true, locked: false },
+        { id: "ink-reply", name: "Reply Ink", visible: true, locked: false },
+      ];
+      setInkLayers(remixSheets);
+      setActiveInkLayerId("ink-reply");
       setImages([remixLayer]);
       setTexts([]);
       setStamps([]);
       setTemplateId("blank");
       setSelectedItem(null);
       setIsCroppingImage(false);
-      setActiveTool("draw");
-      setDrawMode("freehand");
+      setActiveTool("pen");
 
       pushUndoSnapshot({
-        ink: new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT),
+        inkLayers: remixSheets.map((l) => ({
+          ...l,
+          data: new ImageData(CANVAS_WIDTH, CANVAS_HEIGHT),
+        })),
+        activeInkLayerId: "ink-reply",
         images: [remixLayer],
         texts: [],
         stamps: [],
         templateId: "blank",
       });
 
-      document.getElementById("drawing-studio")?.scrollIntoView({ behavior: "smooth" });
+      await closeTopLayer(scrapbookDialogRef.current);
+      setStatusAnnouncement("Loaded postcard onto desk for reply");
     } catch (err) {
       console.error("Remix error:", err);
-      setErrorBanner("Could not load postcard into studio for remix.");
+      setErrorBanner("Could not load postcard onto desk for reply.");
     }
   };
 
@@ -2084,11 +2842,15 @@ export default function App() {
     }
   };
 
-  // Copy URL helper
-  const handleCopyUrl = (url: string) => {
-    navigator.clipboard.writeText(url);
-    setCopiedUrl(url);
-    setTimeout(() => setCopiedUrl(null), 2000);
+  const handleCopyUrl = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopiedUrl(url);
+      setStatusAnnouncement("Firmware URL copied");
+      setTimeout(() => setCopiedUrl(null), 2000);
+    } catch {
+      setStatusAnnouncement("Copy failed");
+    }
   };
 
   const formatTimeAgo = (iso?: string | null) => {
@@ -2104,8 +2866,8 @@ export default function App() {
   const formatRecipientFriendly = (recipient: string) => {
     if (recipient === "all") {
       const count = state?.devices?.length || 2;
-      if (count === 2) return "Both Frames ✨";
-      if (count > 2) return `All ${count} Frames ✨`;
+      if (count === 2) return "Both Frames";
+      if (count > 2) return `All ${count} Frames`;
       return state?.devices?.[0]?.display_name.replace(" Desk Frame", "") || "Frame";
     }
     const found = state?.devices.find((d) => d.device_id === recipient);
@@ -2113,17 +2875,11 @@ export default function App() {
   };
 
   const devicesList = state?.devices || [];
-  const allRecipientsLabel =
-    devicesList.length === 2
-      ? "✨ Both Frames"
-      : `✨ All ${devicesList.length || 2} Frames`;
-
   const onlineDevicesCount = devicesList.filter((d) => {
     const ms = parseSqliteUtcMs(d.last_check_in);
     return ms !== null && Date.now() - ms < 3600 * 1000;
   }).length;
 
-  // Compute SVG overlay selection geometry
   const selectedBox = useMemo(
     () => (selectedItem ? getBoxForItem(selectedItem) : null),
     [selectedItem, getBoxForItem]
@@ -2137,419 +2893,440 @@ export default function App() {
     [selectedBox]
   );
 
+  const stageCursorClass = spaceHeld
+    ? "cursor-grab active:cursor-grabbing"
+    : activeTool === "pen" ||
+      activeTool === "eraser" ||
+      activeTool === "figure" ||
+      activeTool === "fill"
+    ? "cursor-crosshair"
+    : "cursor-default";
+
+  const wellManualHeight = Math.min(Math.max(280, CANVAS_HEIGHT * fitScale + 28), 520);
+
   return (
-    <div className="min-h-screen text-stone-900 pb-20">
+    <div className="min-h-[100dvh] flex flex-col">
       <a
-        href="#drawing-studio"
-        className="visually-hidden focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-xl focus:bg-[#25467a] focus:px-4 focus:py-2 focus:text-sm focus:font-bold focus:text-white focus:shadow-lg"
+        href="#studio-canvas-stage"
+        className="visually-hidden focus:fixed focus:left-3 focus:top-3 focus:z-50 focus:rounded-xl focus:bg-[#25467a] focus:px-3 focus:py-1.5 focus:text-xs focus:font-bold focus:text-white focus:shadow-lg"
       >
-        Skip to drawing canvas
+        Skip to postcard canvas
       </a>
 
-      {/* Compact, Cheerful Studio Header */}
-      <header className="sticky top-0 z-30 border-b border-stone-200/80 bg-[#faf6ef]/90 backdrop-blur-md">
-        <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-2.5 sm:px-6">
-          <div className="flex items-center gap-3">
-            <div
-              className="flex h-10 w-10 -rotate-3 items-center justify-center rounded-2xl bg-[#25467a] text-white shadow-md transition-transform hover:rotate-3"
-              aria-hidden="true"
-            >
-              <Sparkles className="h-5 w-5 text-amber-300" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-lg font-extrabold tracking-tight text-stone-900 sm:text-xl">
-                  InkFrame Duo
-                </h1>
-                <span className="hidden rounded-full bg-amber-100/90 px-2.5 py-0.5 text-[11px] font-bold text-amber-900 border border-amber-300/60 sm:inline-block">
-                  Postcard Studio
-                </span>
-              </div>
-              <p className="text-xs font-medium text-stone-500">
-                Doodle notes, photo collages &amp; desk games for your Spectra 6 frames
-              </p>
-            </div>
-          </div>
+      <p role="status" aria-live="polite" className="visually-hidden">
+        {statusAnnouncement}
+      </p>
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => adminDialogRef.current?.showModal()}
-              className="group inline-flex min-h-[38px] items-center gap-2 rounded-full border border-stone-300/90 bg-white px-3.5 py-1.5 text-xs font-bold text-stone-700 shadow-sm transition hover:border-stone-400 hover:bg-stone-50 active:scale-95"
-              aria-haspopup="dialog"
-            >
-              <span
-                className={`h-2 w-2 rounded-full ${
-                  onlineDevicesCount > 0 ? "bg-emerald-500" : "bg-amber-400"
-                }`}
-                aria-hidden="true"
-              />
-              <span className="hidden sm:inline">
-                {devicesList.length || 2} {devicesList.length === 1 ? "Frame" : "Frames"}
-              </span>
-              <Sliders
-                className="h-3.5 w-3.5 text-stone-500 transition-transform group-hover:rotate-12"
-                aria-hidden="true"
-              />
-              <span>Frames &amp; Admin</span>
-            </button>
-          </div>
-        </div>
-      </header>
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept="image/png,image/jpeg,image/webp"
+        onChange={(e) => {
+          const files = Array.from(e.target.files || []);
+          if (files.length > 0) addImageFiles(files);
+          e.target.value = "";
+        }}
+        className="visually-hidden"
+      />
 
-      {/* Polite Live Region for Notifications & Inline Errors */}
-      <div aria-live="polite" className="mx-auto max-w-4xl px-4 sm:px-6">
+      {/* TOP COMPACT POSTCARD HEADER */}
+      <PostcardHeader
+        canUndo={canUndo}
+        canRedo={canRedo}
+        onUndo={handleUndo}
+        onRedo={handleRedo}
+        onClearAll={handleClearAll}
+        showEInkPreview={showEInkPreview}
+        onToggleEInkPreview={() => setShowEInkPreview((v) => !v)}
+        notesCount={state?.notes.length || 0}
+        onOpenScrapbook={() => scrapbookDialogRef.current?.showModal()}
+        devicesList={devicesList}
+        onlineDevicesCount={onlineDevicesCount}
+        onOpenAdmin={() => adminDialogRef.current?.showModal()}
+        selectedRecipient={selectedRecipient}
+        onChangeRecipient={setSelectedRecipient}
+        webPinRequired={Boolean(state?.config.webPinRequired)}
+        pin={pin}
+        onChangePin={setPin}
+        isSending={isSending}
+        onSendNote={handleSendNote}
+      />
+
+      {/* Gentle Notifications */}
+      <div aria-live="polite" className="mx-auto w-full max-w-[1200px] px-3 pt-2 lg:px-5">
         {errorBanner && (
           <div
             role="alert"
-            className="mt-4 flex items-center justify-between rounded-2xl border-2 border-rose-600/25 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-900 shadow-sm"
+            className="mb-2 flex items-center justify-between gap-2 rounded-2xl border-2 border-rose-200 bg-rose-50 px-3.5 py-2 text-xs font-bold text-rose-800 shadow-sm"
           >
-            <span className="flex items-center gap-2">
-              <AlertCircle className="h-4 w-4 text-rose-600 shrink-0" aria-hidden="true" />
-              {errorBanner}
+            <span className="flex items-center gap-1.5">
+              <AlertCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>{errorBanner}</span>
             </span>
             <button
               type="button"
               onClick={() => setErrorBanner(null)}
-              className="rounded-lg p-1 text-rose-700 hover:bg-rose-100"
               aria-label="Dismiss error"
+              className="rounded-lg p-1 hover:bg-rose-100"
             >
-              <X className="h-4 w-4" aria-hidden="true" />
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
           </div>
         )}
 
         {sendSuccessBanner && (
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-2xl border-2 border-emerald-600/20 bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-900 shadow-sm">
-            <span className="flex items-center gap-2">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-2xl border-2 border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs font-bold text-emerald-900 shadow-sm">
+            <span className="flex items-center gap-1.5">
               <Heart className="h-4 w-4 fill-rose-500 text-rose-500 shrink-0" aria-hidden="true" />
-              {sendSuccessBanner}
+              <span>{sendSuccessBanner}</span>
             </span>
             <div className="flex items-center gap-2">
               {canRestoreSent && (
                 <button
                   type="button"
                   onClick={handleRestoreLastSent}
-                  className="rounded-xl border border-emerald-700/30 bg-white px-3 py-1 text-xs font-extrabold text-emerald-900 hover:bg-emerald-100"
+                  className="rounded-xl border border-emerald-300 bg-white px-2.5 py-1 text-[11px] font-extrabold text-emerald-900 hover:bg-emerald-100"
                 >
-                  Restore to Canvas
+                  Bring Card Back
                 </button>
               )}
               <button
                 type="button"
                 onClick={() => setSendSuccessBanner(null)}
-                className="rounded-lg p-1 text-emerald-700 hover:bg-emerald-100"
                 aria-label="Dismiss notification"
+                className="rounded-lg p-1 hover:bg-emerald-100"
               >
-                <X className="h-4 w-4" aria-hidden="true" />
+                <X className="h-3.5 w-3.5" aria-hidden="true" />
               </button>
             </div>
           </div>
         )}
       </div>
 
-      {/* Main Content: Postcard Drawing Desk */}
-      <main id="drawing-studio" tabIndex={-1} className="mx-auto max-w-4xl px-4 pt-5 sm:px-6">
-        <section
-          aria-label="Postcard Drawing Desk"
-          onDragOver={(e) => {
-            e.preventDefault();
-            setIsDraggingFile(true);
-          }}
-          onDragLeave={(e) => {
-            if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-              setIsDraggingFile(false);
-            }
-          }}
-          onDrop={(e) => {
-            e.preventDefault();
-            setIsDraggingFile(false);
-            const dropped = Array.from(e.dataTransfer.files || []);
-            if (dropped.length > 0) {
-              addImageFiles(dropped);
-            }
-          }}
-          className={`relative mb-10 rounded-[2rem] border-2 bg-white p-4 shadow-[0_12px_36px_-12px_rgba(28,25,23,0.1)] transition-colors sm:p-7 ${
-            isDraggingFile ? "border-[#25467a] bg-blue-50/40" : "border-stone-200/90"
-          }`}
-        >
-          {/* Decorative Washi Tape */}
+      {/* MAIN COZY STATIONERY & RISO DESK */}
+      <main
+        id="drawing-studio"
+        className="mx-auto flex w-full max-w-[1200px] flex-1 flex-col gap-5 px-3 py-3 lg:flex-row lg:items-start lg:px-5 lg:py-4"
+      >
+        {/* Left/Center Column: Washi-Taped Postcard + Pencil Case + Note */}
+        <div className="flex min-w-0 flex-1 flex-col items-center gap-3.5">
+          {/* Postcard Stage Well */}
           <div
-            aria-hidden="true"
-            className="washi-tape pointer-events-none absolute -top-3 left-1/2 h-6 w-32 -translate-x-1/2 -rotate-2 rounded-sm"
-          />
+            ref={wellRef}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDraggingFile(true);
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                setIsDraggingFile(false);
+              }
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              setIsDraggingFile(false);
+              const dropped = Array.from(e.dataTransfer.files || []);
+              if (dropped.length > 0) addImageFiles(dropped);
+            }}
+            className={`relative flex w-full items-center justify-center rounded-3xl p-3 ${
+              zoomMode === "manual" ? "overflow-hidden border border-dashed border-[var(--card-border)] bg-[#f4ede0]/60" : ""
+            } ${isDraggingFile ? "ring-4 ring-[#25467a]/35 bg-[#eef3fb]/60" : ""}`}
+            style={{
+              height: zoomMode === "manual" ? `${wellManualHeight}px` : undefined,
+            }}
+          >
+            {/* Floating E-Ink Peek Pill */}
+            {showEInkPreview && (
+              <div className="pointer-events-none absolute left-4 top-3 z-20 rounded-full bg-[#25467a] px-2.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-white shadow">
+                E-Ink Peek Active
+              </div>
+            )}
 
-          {/* Top Bar: Recipient Pills + Live E-Ink Toggle + Undo/Redo/Clear */}
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2.5">
+            {/* Physical Postcard Paper + Washi Tape Corners */}
             <div
-              role="group"
-              aria-label="Choose postcard recipient"
-              className="flex flex-wrap items-center gap-1.5 rounded-2xl bg-stone-100/90 p-1.5"
+              className="relative shrink-0 rounded-2xl shadow-[0_14px_34px_rgba(68,54,39,0.16),0_3px_0_var(--card-shadow)] ring-1 ring-[#d8cebc]"
+              style={{
+                width: `${CANVAS_WIDTH * effectiveZoom}px`,
+                height: `${CANVAS_HEIGHT * effectiveZoom}px`,
+                transform:
+                  panOffset.x !== 0 || panOffset.y !== 0
+                    ? `translate(${panOffset.x}px, ${panOffset.y}px)`
+                    : undefined,
+              }}
             >
-              <span className="px-2 text-xs font-extrabold uppercase tracking-wider text-stone-500">
-                To:
-              </span>
-              {devicesList.length !== 1 && (
-                <button
-                  type="button"
-                  aria-pressed={selectedRecipient === "all"}
-                  onClick={() => setSelectedRecipient("all")}
-                  className={`min-h-[34px] rounded-xl px-3.5 py-1.5 text-xs font-bold transition-all ${
-                    selectedRecipient === "all"
-                      ? "bg-[#25467a] text-white shadow-sm scale-[1.02]"
-                      : "text-stone-700 hover:bg-white/80"
-                  }`}
-                >
-                  {allRecipientsLabel}
-                </button>
-              )}
-              {devicesList.map((d) => {
-                const shortName = d.display_name.replace(" Desk Frame", "");
-                const isSelected =
-                  selectedRecipient === d.device_id ||
-                  (devicesList.length === 1 && selectedRecipient === "all");
-                const checkMs = parseSqliteUtcMs(d.last_check_in);
-                const isOnline = checkMs !== null && Date.now() - checkMs < 3600 * 1000;
-                return (
-                  <button
-                    key={d.device_id}
-                    type="button"
-                    aria-pressed={isSelected}
-                    onClick={() => setSelectedRecipient(d.device_id)}
-                    className={`inline-flex min-h-[34px] items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-bold transition-all ${
-                      isSelected
-                        ? "bg-[#25467a] text-white shadow-sm scale-[1.02]"
-                        : "text-stone-700 hover:bg-white/80"
-                    }`}
-                  >
-                    <span
-                      className={`h-1.5 w-1.5 rounded-full ${
-                        isOnline ? "bg-emerald-400" : "bg-amber-400"
-                      }`}
-                      aria-hidden="true"
-                    />
-                    <span>🖼️ {shortName}</span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Right Controls: Live E-Ink Preview Toggle + Undo/Redo/Clear */}
-            <div className="flex flex-wrap items-center gap-1.5">
-              <button
-                type="button"
-                aria-pressed={showEInkPreview}
-                onClick={() => setShowEInkPreview((v) => !v)}
-                className={`inline-flex min-h-[36px] items-center gap-1.5 rounded-2xl border px-3 py-1.5 text-xs font-bold transition ${
-                  showEInkPreview
-                    ? "border-[#25467a] bg-[#25467a] text-white shadow-sm"
-                    : "border-stone-200 bg-stone-100/90 text-stone-700 hover:bg-white"
-                }`}
-              >
-                <Eye className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>E-Ink Preview</span>
-              </button>
-
-              <div className="flex items-center gap-1 rounded-2xl bg-stone-100/90 p-1">
-                <button
-                  type="button"
-                  onClick={handleUndo}
-                  disabled={!canUndo}
-                  aria-label="Undo last action"
-                  title="Undo (⌘Z)"
-                  className="inline-flex min-h-[34px] min-w-[34px] items-center justify-center rounded-xl p-1.5 text-stone-700 transition hover:bg-white hover:shadow-sm active:scale-95 disabled:opacity-30 disabled:hover:bg-transparent"
-                >
-                  <Undo2 className="h-4 w-4" aria-hidden="true" />
-                </button>
-                <button
-                  type="button"
-                  onClick={handleRedo}
-                  disabled={!canRedo}
-                  aria-label="Redo action"
-                  title="Redo (⌘⇧Z)"
-                  className="inline-flex min-h-[34px] min-w-[34px] items-center justify-center rounded-xl p-1.5 text-stone-700 transition hover:bg-white hover:shadow-sm active:scale-95 disabled:opacity-30 disabled:hover:bg-transparent"
-                >
-                  <Redo2 className="h-4 w-4" aria-hidden="true" />
-                </button>
-                <div className="mx-0.5 h-4 w-px bg-stone-300/80" aria-hidden="true" />
-                <button
-                  type="button"
-                  onClick={handleClearAll}
-                  aria-label="Clear entire postcard"
-                  className="inline-flex min-h-[34px] items-center gap-1 rounded-xl px-2.5 py-1.5 text-xs font-bold text-rose-700 transition hover:bg-white hover:shadow-sm active:scale-95"
-                >
-                  <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span className="hidden sm:inline">Clear</span>
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Primary Palette & Studio Tool Bar */}
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-stone-200/80 bg-[#faf6ef]/80 px-3 py-2">
-            {/* All 6 Spectra Pigments + Separated Eraser */}
-            <div className="flex flex-wrap items-center gap-2">
               <div
-                role="group"
-                aria-label="Spectra 6 ink colors"
-                className="flex flex-wrap items-center gap-1.5"
-              >
-                {SPECTRA_PALETTE.map((color) => {
-                  const isSelected =
-                    (selectedText?.color ?? selectedStamp?.color ?? currentColor) === color.hex &&
-                    activeTool !== "eraser";
-                  return (
-                    <button
-                      key={color.name}
-                      type="button"
-                      aria-label={color.name}
-                      title={color.name}
-                      aria-pressed={isSelected}
-                      onClick={() => handleSelectColorPot(color.hex)}
-                      className={`group relative flex h-8 w-8 items-center justify-center rounded-full transition-all duration-150 ${
-                        isSelected
-                          ? "-translate-y-0.5 scale-110 shadow-md ring-2 ring-[#25467a] ring-offset-2"
-                          : "hover:-translate-y-0.5 hover:scale-105 shadow-sm"
-                      }`}
-                      style={{
-                        backgroundColor: color.hex,
-                        border: color.isWhite
-                          ? "2px solid #78716c"
-                          : "2px solid rgba(255,255,255,0.85)",
-                      }}
-                    >
-                      {isSelected && (
-                        <span
-                          className={`h-2 w-2 rounded-full ${
-                            color.isWhite || color.name.includes("Yellow")
-                              ? "bg-stone-900"
-                              : "bg-white"
-                          }`}
-                          aria-hidden="true"
-                        />
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div className="mx-0.5 h-5 w-px bg-stone-300/70" aria-hidden="true" />
-
-              {/* Tool Mode Switcher */}
-              <div
-                role="group"
-                aria-label="Studio tools"
-                className="flex flex-wrap items-center gap-0.5 rounded-xl bg-white p-1 border border-stone-200/80 shadow-sm"
-              >
-                {(
-                  [
-                    { id: "draw", label: "Draw", icon: PenTool },
-                    { id: "eraser", label: "Eraser", icon: Eraser },
-                    { id: "arrange", label: "Arrange", icon: Move },
-                    { id: "text", label: "Text", icon: Type },
-                    { id: "stamp", label: "Stamps", icon: StampIcon },
-                    { id: "paper", label: "Paper", icon: FileText },
-                  ] as Array<{
-                    id: ToolMode;
-                    label: string;
-                    icon: React.ComponentType<{ className?: string }>;
-                  }>
-                ).map((t) => {
-                  const Icon = t.icon;
-                  const active = activeTool === t.id;
-                  return (
-                    <button
-                      key={t.id}
-                      type="button"
-                      aria-pressed={active}
-                      onClick={() => {
-                        setActiveTool(t.id);
-                        if (t.id === "draw" || t.id === "eraser" || t.id === "paper") {
-                          setSelectedItem(null);
-                          setIsCroppingImage(false);
-                        }
-                      }}
-                      className={`inline-flex min-h-[30px] items-center gap-1 rounded-lg px-2 py-1 text-xs font-bold transition ${
-                        active
-                          ? "bg-[#25467a] text-white shadow-sm"
-                          : "text-stone-700 hover:bg-stone-100"
-                      }`}
-                    >
-                      <Icon className="h-3.5 w-3.5" aria-hidden="true" />
-                      <span className="hidden sm:inline">{t.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Brush Size Selector (shown in Draw / Eraser) or Quick Add Photos */}
-            <div className="flex items-center gap-1.5">
-              {(activeTool === "draw" || activeTool === "eraser") && (
-                <div
-                  role="group"
-                  aria-label="Brush thickness"
-                  className="flex items-center gap-0.5 rounded-xl bg-white p-1 border border-stone-200/80 shadow-sm"
-                >
-                  {BRUSH_SIZES.map((b) => {
-                    const isSelected = brushSize === b.size;
-                    return (
-                      <button
-                        key={b.size}
-                        type="button"
-                        aria-label={`${b.label} nib (${b.size}px)`}
-                        aria-pressed={isSelected}
-                        onClick={() => setBrushSize(b.size)}
-                        className={`flex min-h-[30px] items-center gap-1 rounded-lg px-2 py-1 text-xs font-bold transition ${
-                          isSelected
-                            ? "bg-stone-900 text-white shadow-sm"
-                            : "text-stone-600 hover:bg-stone-100 hover:text-stone-900"
-                        }`}
-                      >
-                        <span
-                          className="inline-block rounded-full bg-current"
-                          style={{ width: `${b.dot}px`, height: `${b.dot}px` }}
-                          aria-hidden="true"
-                        />
-                        <span className="hidden lg:inline">{b.label}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="inline-flex min-h-[34px] items-center gap-1.5 rounded-xl border border-stone-300 bg-white px-2.5 py-1 text-xs font-bold text-stone-800 shadow-sm transition hover:bg-stone-50 active:scale-95"
-              >
-                <ImagePlus className="h-3.5 w-3.5 text-[#25467a]" aria-hidden="true" />
-                <span>+ Photos</span>
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                accept="image/png,image/jpeg,image/webp"
-                onChange={(e) => {
-                  const files = Array.from(e.target.files || []);
-                  if (files.length > 0) addImageFiles(files);
-                  e.target.value = "";
-                }}
-                className="visually-hidden"
+                aria-hidden="true"
+                className="washi-tape-amber absolute -left-3 -top-2 z-20 h-4 w-16 -rotate-12 rounded-sm"
               />
+              <div
+                aria-hidden="true"
+                className="washi-tape-rose absolute -right-3 -top-2 z-20 h-4 w-16 rotate-12 rounded-sm"
+              />
+
+              <div
+                ref={stageRef}
+                id="studio-canvas-stage"
+                role="application"
+                tabIndex={0}
+                aria-label="800 by 480 pixel Spectra 6 postcard drawing canvas"
+                onPointerDown={handleStagePointerDown}
+                onPointerMove={handleStagePointerMove}
+                onPointerUp={handleStagePointerUp}
+                onPointerCancel={handleStagePointerUp}
+                onPointerLeave={() => setHoverPoint(null)}
+                onDoubleClick={handleStageDoubleClick}
+                className={`relative h-full w-full overflow-hidden rounded-2xl bg-[#e8e4d9] select-none touch-none ${stageCursorClass}`}
+              >
+                {/* Layer 0: Photos Background */}
+                <canvas
+                  ref={bgCanvasRef}
+                  width={CANVAS_WIDTH}
+                  height={CANVAS_HEIGHT}
+                  className="pointer-events-none absolute inset-0 h-full w-full"
+                  style={{ imageRendering: effectiveZoom >= 1.5 ? "pixelated" : "auto" }}
+                />
+
+                {/* Layer 1: Stationery Template & Crisp Polaroid/Stamp Cutout Mats */}
+                <canvas
+                  ref={crispUnderlayCanvasRef}
+                  width={CANVAS_WIDTH}
+                  height={CANVAS_HEIGHT}
+                  className="pointer-events-none absolute inset-0 h-full w-full"
+                  style={{ imageRendering: effectiveZoom >= 1.5 ? "pixelated" : "auto" }}
+                />
+
+                {/* Layer 2..N: Tracing Sheets (e.g. Coloring beneath Lineart) */}
+                {inkLayers.map((layer) => (
+                  <canvas
+                    key={layer.id}
+                    ref={getInkCanvasRefCallback(layer.id)}
+                    width={CANVAS_WIDTH}
+                    height={CANVAS_HEIGHT}
+                    className={`pointer-events-none absolute inset-0 h-full w-full ${
+                      layer.visible ? "opacity-100" : "opacity-0"
+                    }`}
+                    style={{ imageRendering: effectiveZoom >= 1.5 ? "pixelated" : "auto" }}
+                  />
+                ))}
+
+                {/* Layer N+1: Stickers & Labels + Live Shape Preview */}
+                <canvas
+                  ref={objectsCanvasRef}
+                  width={CANVAS_WIDTH}
+                  height={CANVAS_HEIGHT}
+                  className="pointer-events-none absolute inset-0 h-full w-full"
+                  style={{ imageRendering: effectiveZoom >= 1.5 ? "pixelated" : "auto" }}
+                />
+
+                {/* Layer N+2: Live E-Ink Quantized Peek Overlay */}
+                <canvas
+                  ref={eInkPreviewCanvasRef}
+                  width={CANVAS_WIDTH}
+                  height={CANVAS_HEIGHT}
+                  className={`pointer-events-none absolute inset-0 h-full w-full transition-opacity duration-150 ${
+                    showEInkPreview && !isDrawingActive ? "opacity-100" : "opacity-0"
+                  }`}
+                  style={{ imageRendering: effectiveZoom >= 1.5 ? "pixelated" : "auto" }}
+                />
+
+                {/* Interactive Handles & Crisp Brush Nib Ring */}
+                <svg
+                  viewBox={`0 0 ${CANVAS_WIDTH} ${CANVAS_HEIGHT}`}
+                  className="pointer-events-none absolute inset-0 h-full w-full"
+                >
+                  {snapGuides.x && (
+                    <line
+                      x1={CANVAS_WIDTH / 2}
+                      y1={0}
+                      x2={CANVAS_WIDTH / 2}
+                      y2={CANVAS_HEIGHT}
+                      stroke="#25467a"
+                      strokeWidth={1.5}
+                      strokeDasharray="6 4"
+                    />
+                  )}
+                  {snapGuides.y && (
+                    <line
+                      x1={0}
+                      y1={CANVAS_HEIGHT / 2}
+                      x2={CANVAS_WIDTH}
+                      y2={CANVAS_HEIGHT / 2}
+                      stroke="#25467a"
+                      strokeWidth={1.5}
+                      strokeDasharray="6 4"
+                    />
+                  )}
+
+                  {selectedBox && selectedCorners && selectedRotHandle && (
+                    <g>
+                      <polygon
+                        points={selectedCorners.map((c) => `${c.x},${c.y}`).join(" ")}
+                        fill="none"
+                        stroke={isCroppingImage ? "#b45309" : "#25467a"}
+                        strokeWidth={2}
+                        strokeDasharray={isCroppingImage ? "5 4" : undefined}
+                      />
+
+                      {isCroppingImage && selectedItem?.kind === "image" ? (
+                        [
+                          {
+                            x: (selectedCorners[0].x + selectedCorners[1].x) / 2,
+                            y: (selectedCorners[0].y + selectedCorners[1].y) / 2,
+                          },
+                          {
+                            x: (selectedCorners[1].x + selectedCorners[2].x) / 2,
+                            y: (selectedCorners[1].y + selectedCorners[2].y) / 2,
+                          },
+                          {
+                            x: (selectedCorners[2].x + selectedCorners[3].x) / 2,
+                            y: (selectedCorners[2].y + selectedCorners[3].y) / 2,
+                          },
+                          {
+                            x: (selectedCorners[3].x + selectedCorners[0].x) / 2,
+                            y: (selectedCorners[3].y + selectedCorners[0].y) / 2,
+                          },
+                        ].map((ep, idx) => (
+                          <circle
+                            key={idx}
+                            cx={ep.x}
+                            cy={ep.y}
+                            r={7}
+                            fill="#fef3c7"
+                            stroke="#b45309"
+                            strokeWidth={2.5}
+                          />
+                        ))
+                      ) : (
+                        <>
+                          <line
+                            x1={(selectedCorners[0].x + selectedCorners[1].x) / 2}
+                            y1={(selectedCorners[0].y + selectedCorners[1].y) / 2}
+                            x2={selectedRotHandle.x}
+                            y2={selectedRotHandle.y}
+                            stroke="#25467a"
+                            strokeWidth={2}
+                          />
+                          <circle
+                            cx={selectedRotHandle.x}
+                            cy={selectedRotHandle.y}
+                            r={8}
+                            fill="#ffffff"
+                            stroke="#25467a"
+                            strokeWidth={2.5}
+                          />
+                          {selectedCorners.map((c, idx) => (
+                            <rect
+                              key={idx}
+                              x={c.x - 6}
+                              y={c.y - 6}
+                              width={12}
+                              height={12}
+                              rx={3}
+                              fill="#ffffff"
+                              stroke="#25467a"
+                              strokeWidth={2.5}
+                            />
+                          ))}
+                        </>
+                      )}
+                    </g>
+                  )}
+
+                  {hoverPoint &&
+                    !spaceHeld &&
+                    (activeTool === "pen" ||
+                      activeTool === "eraser" ||
+                      activeTool === "figure") && (
+                      <circle
+                        cx={hoverPoint.x}
+                        cy={hoverPoint.y}
+                        r={Math.max(2, brushSize / 2)}
+                        fill="none"
+                        stroke={activeTool === "eraser" ? "#9e2a1f" : mainColor}
+                        strokeWidth={1.5 / Math.max(0.5, effectiveZoom)}
+                        strokeDasharray={activeTool === "eraser" ? "3 2" : undefined}
+                        opacity={0.85}
+                      />
+                    )}
+                </svg>
+
+                {isDraggingFile && (
+                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-[#25467a]/25 backdrop-blur-[1px]">
+                    <div className="rounded-2xl border-2 border-dashed border-white bg-[#25467a]/95 px-5 py-2.5 text-xs font-extrabold text-white shadow-lg">
+                      Drop photo(s) onto your postcard!
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Quiet Bottom-Right Zoom Pill */}
+            <div className="absolute bottom-2 right-2 z-20 flex items-center gap-0.5 rounded-full border border-[var(--card-border)] bg-[#fffdf9]/90 px-1.5 py-0.5 text-[11px] font-bold text-stone-700 shadow-sm backdrop-blur-sm">
+              <button
+                type="button"
+                onClick={handleZoomOut}
+                aria-label="Zoom out"
+                title="Zoom out (-)"
+                className="rounded-full p-1 hover:bg-[#f5efe4]"
+              >
+                <Minus className="h-3 w-3" aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                onClick={handleZoomFit}
+                title="Reset zoom to fit desk (0)"
+                className="rounded-full px-1.5 py-0.5 font-mono text-[10px] hover:bg-[#f5efe4]"
+              >
+                {zoomMode === "fit" && Math.abs(fitScale - 1) < 0.02
+                  ? "100%"
+                  : `${Math.round(effectiveZoom * 100)}%`}
+              </button>
+              <button
+                type="button"
+                onClick={handleZoomIn}
+                aria-label="Zoom in"
+                title="Zoom in (+)"
+                className="rounded-full p-1 hover:bg-[#f5efe4]"
+              >
+                <Plus className="h-3 w-3" aria-hidden="true" />
+              </button>
             </div>
           </div>
 
-          {/* Contextual Sub-Toolbar */}
-          <StudioToolbars
+          {/* TACTILE PENCIL CASE DOCK */}
+          <PencilCaseDock
             activeTool={activeTool}
+            onSelectTool={(t) => {
+              setActiveTool(t);
+              if (
+                t === "pen" ||
+                t === "eraser" ||
+                t === "figure" ||
+                t === "fill" ||
+                t === "paper"
+              ) {
+                setSelectedItem(null);
+                setIsCroppingImage(false);
+              }
+            }}
+            brushSize={brushSize}
+            onChangeBrushSize={setBrushSize}
+            penFeel={penFeel}
+            onChangePenFeel={setPenFeel}
+            inkTexture={inkTexture}
+            hasMixActive={selectedMixId !== null}
+            onSwitchToSolid={() => handleChangeInkTexture("solid")}
+            eraserStyle={eraserStyle}
+            onChangeEraserStyle={setEraserStyle}
+            onClearActiveInkLayer={handleClearActiveInkLayer}
+            figureShape={figureShape}
+            onChangeFigureShape={setFigureShape}
+            figureFillMode={figureFillMode}
+            onChangeFigureFillMode={setFigureFillMode}
+            fillReference={fillReference}
+            onChangeFillReference={setFillReference}
             selectedItem={selectedItem}
-            brushStyle={brushStyle}
-            onChangeBrushStyle={setBrushStyle}
-            drawMode={drawMode}
-            onChangeDrawMode={setDrawMode}
-            currentColor={currentColor}
             images={images}
             selectedImage={selectedImage}
             isCroppingImage={isCroppingImage}
@@ -2557,10 +3334,7 @@ export default function App() {
             onAddPhotosClick={() => fileInputRef.current?.click()}
             onApplyCollageLayout={handleApplyCollageLayout}
             onUpdateImage={handleUpdateImage}
-            onCommitImageChange={() => pushUndoSnapshot()}
             onApplyImageAspectCrop={handleApplyImageAspectCrop}
-            onFillCanvasImage={handleFillCanvasImage}
-            onReorderImage={handleReorderImage}
             onDuplicateImage={handleDuplicateImage}
             onDeleteSelected={handleDeleteSelected}
             ditherAlgo={ditherAlgo}
@@ -2569,445 +3343,127 @@ export default function App() {
             draftText={draftText}
             draftFont={draftFont}
             draftBackdrop={draftBackdrop}
+            draftFontSize={draftFontSize}
             textInputRef={textInputRef}
             onChangeDraftText={handleChangeDraftText}
             onChangeDraftFont={handleChangeDraftFont}
             onChangeDraftBackdrop={handleChangeDraftBackdrop}
+            onChangeDraftFontSize={handleChangeDraftFontSize}
             onAddNewText={handleAddNewText}
             selectedStamp={selectedStamp}
             onPlaceStamp={handlePlaceStamp}
             onRotateSelectedStamp={handleRotateSelectedStamp}
+            onScaleSelectedStamp={handleScaleSelectedStamp}
             templateId={templateId}
             onChangeTemplate={handleChangeTemplate}
           />
 
-          {/* Physical Desk Frame Bezel & Multi-Layer 800x480 Canvas Stage */}
-          <div className="relative mx-auto w-full max-w-[800px] rounded-[1.5rem] bg-stone-800 p-2.5 shadow-[0_14px_30px_-8px_rgba(28,25,23,0.35),inset_0_2px_4px_rgba(255,255,255,0.15)] sm:p-4">
-            <div
-              ref={stageRef}
-              role="application"
-              aria-label="800 by 480 pixel interactive postcard studio canvas"
-              onPointerDown={handleStagePointerDown}
-              onPointerMove={handleStagePointerMove}
-              onPointerUp={handleStagePointerUp}
-              onPointerCancel={handleStagePointerUp}
-              onPointerLeave={() => setHoverPoint(null)}
-              onDoubleClick={handleStageDoubleClick}
-              className={`relative overflow-hidden rounded-xl bg-[#e8e4d9] aspect-[5/3] select-none shadow-inner touch-none ${
-                activeTool === "draw" || activeTool === "eraser"
-                  ? "cursor-crosshair"
-                  : "cursor-default"
-              }`}
+          {/* Warm Scrapbook Caption Note (single instance) */}
+          <div className="mx-auto flex w-full max-w-[820px] items-center gap-2 rounded-2xl border-2 border-[var(--card-border)] bg-[var(--card-surface)] px-3.5 py-2 shadow-[0_3px_0_var(--card-shadow)]">
+            <label
+              htmlFor="postcard-caption"
+              className="shrink-0 text-[11px] font-extrabold uppercase tracking-wide text-[#6b6359]"
             >
-              {/* Layer 0: Background Paper + Multi-Image Photo Layer */}
-              <canvas
-                ref={bgCanvasRef}
-                width={CANVAS_WIDTH}
-                height={CANVAS_HEIGHT}
-                className="pointer-events-none absolute inset-0 h-full w-full"
-              />
-
-              {/* Layer 1: Stationery Templates & Crisp Photo Mats */}
-              <canvas
-                ref={crispUnderlayCanvasRef}
-                width={CANVAS_WIDTH}
-                height={CANVAS_HEIGHT}
-                className="pointer-events-none absolute inset-0 h-full w-full"
-              />
-
-              {/* Layer 2: Freehand Ink, Shapes, Flood Fills & Eraser */}
-              <canvas
-                ref={inkCanvasRef}
-                width={CANVAS_WIDTH}
-                height={CANVAS_HEIGHT}
-                className="pointer-events-none absolute inset-0 h-full w-full"
-              />
-
-              {/* Layer 3: Draggable Stamps, Text Labels & Drag-Shape Preview */}
-              <canvas
-                ref={objectsCanvasRef}
-                width={CANVAS_WIDTH}
-                height={CANVAS_HEIGHT}
-                className="pointer-events-none absolute inset-0 h-full w-full"
-              />
-
-              {/* Layer 4: Live Quantized Spectra 6 E-Ink Preview */}
-              <canvas
-                ref={eInkPreviewCanvasRef}
-                width={CANVAS_WIDTH}
-                height={CANVAS_HEIGHT}
-                className={`pointer-events-none absolute inset-0 h-full w-full transition-opacity duration-100 ${
-                  showEInkPreview && !isDrawingActive ? "opacity-100" : "opacity-0"
-                }`}
-              />
-
-              {/* Layer 5: SVG Snap Guides, Transform Handles & Brush Ring Cursor */}
-              <svg
-                viewBox={`0 0 ${CANVAS_WIDTH} ${CANVAS_HEIGHT}`}
-                className="pointer-events-none absolute inset-0 h-full w-full"
-              >
-                {/* Magnetic Center Snap Guides */}
-                {snapGuides.x && (
-                  <line
-                    x1={CANVAS_WIDTH / 2}
-                    y1={0}
-                    x2={CANVAS_WIDTH / 2}
-                    y2={CANVAS_HEIGHT}
-                    stroke="#25467a"
-                    strokeWidth={1.5}
-                    strokeDasharray="6 4"
-                  />
-                )}
-                {snapGuides.y && (
-                  <line
-                    x1={0}
-                    y1={CANVAS_HEIGHT / 2}
-                    x2={CANVAS_WIDTH}
-                    y2={CANVAS_HEIGHT / 2}
-                    stroke="#25467a"
-                    strokeWidth={1.5}
-                    strokeDasharray="6 4"
-                  />
-                )}
-
-                {/* Selection Box, Scale Corner Handles & Rotation Handle */}
-                {selectedBox && selectedCorners && selectedRotHandle && (
-                  <g>
-                    <polygon
-                      points={selectedCorners.map((c) => `${c.x},${c.y}`).join(" ")}
-                      fill="none"
-                      stroke={isCroppingImage ? "#b45309" : "#25467a"}
-                      strokeWidth={2}
-                      strokeDasharray={isCroppingImage ? "5 4" : undefined}
-                    />
-
-                    {isCroppingImage && selectedItem?.kind === "image" ? (
-                      // 4 Edge Crop Handles
-                      [
-                        {
-                          x: (selectedCorners[0].x + selectedCorners[1].x) / 2,
-                          y: (selectedCorners[0].y + selectedCorners[1].y) / 2,
-                        },
-                        {
-                          x: (selectedCorners[1].x + selectedCorners[2].x) / 2,
-                          y: (selectedCorners[1].y + selectedCorners[2].y) / 2,
-                        },
-                        {
-                          x: (selectedCorners[2].x + selectedCorners[3].x) / 2,
-                          y: (selectedCorners[2].y + selectedCorners[3].y) / 2,
-                        },
-                        {
-                          x: (selectedCorners[3].x + selectedCorners[0].x) / 2,
-                          y: (selectedCorners[3].y + selectedCorners[0].y) / 2,
-                        },
-                      ].map((ep, idx) => (
-                        <circle
-                          key={idx}
-                          cx={ep.x}
-                          cy={ep.y}
-                          r={7}
-                          fill="#fef3c7"
-                          stroke="#b45309"
-                          strokeWidth={2.5}
-                        />
-                      ))
-                    ) : (
-                      <>
-                        {/* Lollipop Rotation Stem & Knob */}
-                        <line
-                          x1={(selectedCorners[0].x + selectedCorners[1].x) / 2}
-                          y1={(selectedCorners[0].y + selectedCorners[1].y) / 2}
-                          x2={selectedRotHandle.x}
-                          y2={selectedRotHandle.y}
-                          stroke="#25467a"
-                          strokeWidth={2}
-                        />
-                        <circle
-                          cx={selectedRotHandle.x}
-                          cy={selectedRotHandle.y}
-                          r={8}
-                          fill="#ffffff"
-                          stroke="#25467a"
-                          strokeWidth={2.5}
-                        />
-
-                        {/* 4 Corner Scale Handles */}
-                        {selectedCorners.map((c, idx) => (
-                          <rect
-                            key={idx}
-                            x={c.x - 6}
-                            y={c.y - 6}
-                            width={12}
-                            height={12}
-                            rx={3}
-                            fill="#ffffff"
-                            stroke="#25467a"
-                            strokeWidth={2.5}
-                          />
-                        ))}
-                      </>
-                    )}
-                  </g>
-                )}
-
-                {/* Exact-Sized Brush / Eraser Nib Preview Cursor */}
-                {hoverPoint &&
-                  (activeTool === "draw" || activeTool === "eraser") &&
-                  drawMode !== "fill" && (
-                    <circle
-                      cx={hoverPoint.x}
-                      cy={hoverPoint.y}
-                      r={Math.max(2, brushSize / 2)}
-                      fill="none"
-                      stroke={activeTool === "eraser" ? "#9e2a1f" : currentColor}
-                      strokeWidth={1.5}
-                      strokeDasharray={activeTool === "eraser" ? "3 2" : undefined}
-                      opacity={0.85}
-                    />
-                  )}
-              </svg>
-
-              {/* Drag-and-Drop Overlay */}
-              {isDraggingFile && (
-                <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-[#25467a]/20 backdrop-blur-[1px]">
-                  <div className="rounded-2xl border-2 border-dashed border-white bg-[#25467a]/90 px-6 py-3 text-sm font-extrabold text-white shadow-lg">
-                    Drop photo(s) onto your postcard!
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Subtle Frame Bezel Label */}
-            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 px-2 text-[11px] font-medium text-stone-400">
-              <span>
-                Spectra 6 Paper Canvas (800×480)
-                {images.length > 0 ? ` • ${images.length} photo${images.length > 1 ? "s" : ""}` : ""}
-                {showEInkPreview ? " • Live 6-Color E-Ink Preview" : ""}
-              </span>
-              <span>
-                {activeTool === "eraser"
-                  ? "Eraser active (ink only)"
-                  : selectedItem
-                  ? "Drag to move • Corners to scale • Top knob to rotate (Hold Shift for 15° snap)"
-                  : "Draw smoothly, drag/paste photos, or add stamps & templates"}
-              </span>
-            </div>
+              Back of Card
+            </label>
+            <input
+              id="postcard-caption"
+              type="text"
+              maxLength={80}
+              value={caption}
+              onChange={(e) => setCaption(e.target.value)}
+              placeholder="Optional little keepsake title for your scrapbook..."
+              className="min-w-0 flex-1 bg-transparent text-xs font-bold text-stone-900 placeholder:font-medium placeholder:text-stone-400 focus:outline-none"
+            />
           </div>
+        </div>
 
-          {/* Bottom Action Bar: Scrapbook Archive Title + PIN + Beam CTA */}
-          <div className="mt-6 flex flex-col gap-4 border-t border-stone-100 pt-5 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex flex-wrap items-center gap-2.5">
-              <div className="flex items-center">
-                <label htmlFor="postcard-caption" className="visually-hidden">
-                  Archive title for Scrapbook (web only, optional)
-                </label>
-                <input
-                  id="postcard-caption"
-                  type="text"
-                  placeholder="Archive title for Scrapbook (web only, optional)..."
-                  value={caption}
-                  onChange={(e) => setCaption(e.target.value)}
-                  className="min-h-[42px] w-72 max-w-full rounded-2xl border border-stone-200 bg-stone-50/60 px-3.5 py-2 text-xs font-medium text-stone-800 placeholder:text-stone-400 focus:bg-white"
-                />
-              </div>
+        {/* Right Side Cards: Ink Pots & Tracing Sheets */}
+        <aside
+          aria-label="Ink palette and tracing sheets"
+          className="w-full space-y-4 lg:w-[276px] shrink-0"
+        >
+          <InkPaletteCard
+            mainColor={mainColor}
+            selectedMixId={selectedMixId}
+            inkTexture={inkTexture}
+            onSelectPureColor={handleSelectPureColor}
+            onSelectOpticalMix={handleSelectOpticalMix}
+            onChangeInkTexture={handleChangeInkTexture}
+          />
 
-              {state?.config.webPinRequired && (
-                <div>
-                  <label htmlFor="studio-pin" className="visually-hidden">
-                    Studio Access PIN
-                  </label>
-                  <input
-                    id="studio-pin"
-                    type="password"
-                    placeholder="PIN"
-                    autoComplete="current-password"
-                    value={pin}
-                    onChange={(e) => setPin(e.target.value)}
-                    className="min-h-[42px] w-24 rounded-2xl border border-stone-300 bg-white px-3 py-2 text-xs font-mono"
-                  />
-                </div>
-              )}
-            </div>
-
-            <button
-              type="button"
-              onClick={handleSendNote}
-              disabled={isSending}
-              className="inline-flex min-h-[48px] items-center justify-center gap-2.5 rounded-2xl bg-[#9e2a1f] px-7 py-3 text-sm font-extrabold text-white shadow-[0_6px_20px_-4px_rgba(158,42,31,0.5)] transition-all hover:-translate-y-0.5 hover:bg-[#832118] active:translate-y-0 active:scale-95 disabled:opacity-50"
-            >
-              <Send className={`h-4 w-4 ${isSending ? "animate-bounce" : ""}`} aria-hidden="true" />
-              <span>{isSending ? "Beaming to Frame..." : "Beam to Frame!"}</span>
-            </button>
-          </div>
-        </section>
-
-        {/* Secondary Disclosure: Scrapbook Flipbook Archive */}
-        <section aria-labelledby="scrapbook-heading" className="mt-8">
-          <details
-            className="group rounded-3xl border border-stone-200/90 bg-white/80 p-5 shadow-sm backdrop-blur-sm sm:p-6"
-            open
-          >
-            <summary className="flex cursor-pointer list-none items-center justify-between gap-4">
-              <div className="flex items-center gap-3">
-                <div
-                  className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-100 text-amber-800"
-                  aria-hidden="true"
-                >
-                  <BookOpen className="h-4 w-4" />
-                </div>
-                <div>
-                  <h2 id="scrapbook-heading" className="text-base font-extrabold text-stone-900">
-                    Postcard Scrapbook ({state?.notes.length || 0})
-                  </h2>
-                  <p className="text-xs text-stone-500">
-                    Past doodles &amp; memories • Remix onto canvas to reply, or beam straight to{" "}
-                    {formatRecipientFriendly(selectedRecipient)}
-                  </p>
-                </div>
-              </div>
-              <span className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-3 py-1 text-xs font-bold text-stone-600 group-hover:bg-stone-200/70">
-                <span>Toggle</span>
-                <ChevronDown
-                  className="h-3.5 w-3.5 transition-transform duration-200 group-open:rotate-180"
-                  aria-hidden="true"
-                />
-              </span>
-            </summary>
-
-            <div className="mt-6">
-              {state?.notes && state.notes.length > 0 ? (
-                <ul role="list" className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
-                  {state.notes.map((note, idx) => {
-                    const showTheoretical = showHardwareLut[note.id] ?? false;
-                    const noteDate = new Date(note.created_at);
-                    const tiltClass =
-                      idx % 3 === 0
-                        ? "hover:-rotate-1"
-                        : idx % 3 === 1
-                        ? "hover:rotate-1"
-                        : "hover:-rotate-0.5";
-
-                    return (
-                      <li
-                        key={note.id}
-                        className={`group/card flex flex-col justify-between rounded-2xl border border-stone-200/90 bg-[#fdfcf9] p-3.5 shadow-sm transition-all duration-200 hover:-translate-y-1 hover:shadow-md ${tiltClass}`}
-                      >
-                        <div>
-                          <div className="overflow-hidden rounded-xl border border-stone-200 bg-stone-100 aspect-[5/3] relative">
-                            <img
-                              src={`/api/notes/${note.id}/${showTheoretical ? "device" : "preview"}.png`}
-                              alt={
-                                note.caption
-                                  ? `Postcard: ${note.caption}`
-                                  : `Postcard sent to ${note.recipient}`
-                              }
-                              width={800}
-                              height={480}
-                              loading="lazy"
-                              className="h-full w-full object-cover"
-                            />
-                          </div>
-
-                          {note.caption && (
-                            <p className="mt-2.5 text-xs font-bold text-stone-800 line-clamp-1">
-                              “{note.caption}”
-                            </p>
-                          )}
-                        </div>
-
-                        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-stone-100 pt-2.5">
-                          <div>
-                            <span className="inline-block rounded-lg bg-stone-100 px-2 py-0.5 text-[11px] font-bold text-stone-700">
-                              To: {formatRecipientFriendly(note.recipient)}
-                            </span>
-                            <p className="mt-0.5 text-[11px] text-stone-400">
-                              {noteDate.toLocaleDateString(undefined, {
-                                month: "short",
-                                day: "numeric",
-                              })}{" "}
-                              at{" "}
-                              {noteDate.toLocaleTimeString([], {
-                                hour: "2-digit",
-                                minute: "2-digit",
-                              })}
-                            </p>
-                          </div>
-
-                          <div className="flex items-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => handleRemixNote(note.id)}
-                              title="Load onto canvas to reply or play next turn"
-                              aria-label={`Remix or reply to postcard from ${noteDate.toLocaleDateString()}`}
-                              className="inline-flex min-h-[32px] items-center gap-1 rounded-xl border border-stone-200 bg-white px-2.5 py-1 text-xs font-bold text-[#25467a] shadow-sm transition hover:border-[#25467a] hover:bg-blue-50/50 active:scale-95"
-                            >
-                              <Reply className="h-3 w-3" aria-hidden="true" />
-                              <span>Remix</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleResend(note.id)}
-                              title={`Beam again to ${formatRecipientFriendly(selectedRecipient)}`}
-                              aria-label={`Beam postcard again to ${formatRecipientFriendly(selectedRecipient)}`}
-                              className="inline-flex min-h-[32px] items-center gap-1 rounded-xl border border-stone-200 bg-white px-2.5 py-1 text-xs font-bold text-stone-700 shadow-sm transition hover:border-[#25467a] hover:text-[#25467a] active:scale-95"
-                            >
-                              <RotateCcw className="h-3 w-3" aria-hidden="true" />
-                              <span>Beam</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => confirmDeleteNote(note.id)}
-                              aria-label={`Delete postcard from ${noteDate.toLocaleDateString()}`}
-                              className="inline-flex min-h-[32px] min-w-[32px] items-center justify-center rounded-xl p-1.5 text-stone-400 transition hover:bg-rose-50 hover:text-rose-600"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-                            </button>
-                          </div>
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-              ) : (
-                <div className="rounded-2xl border-2 border-dashed border-stone-200 bg-stone-50/50 p-10 text-center">
-                  <Sparkles className="mx-auto mb-2 h-6 w-6 text-amber-500" aria-hidden="true" />
-                  <p className="text-sm font-bold text-stone-700">
-                    Your scrapbook is waiting for its first doodle!
-                  </p>
-                  <p className="mt-1 text-xs text-stone-500">
-                    Pick a color above and sketch a note to light up a desk frame.
-                  </p>
-                </div>
-              )}
-            </div>
-          </details>
-        </section>
+          <TracingSheetsCard
+            inkLayers={inkLayers}
+            activeInkLayerId={activeInkLayerId}
+            onSelectInkLayer={setActiveInkLayerId}
+            onAddInkLayer={handleAddInkLayer}
+            onMoveInkLayer={handleMoveInkLayer}
+            onMergeDownInkLayer={handleMergeDownInkLayer}
+            onClearActiveInkLayer={handleClearActiveInkLayer}
+            onDeleteActiveInkLayer={handleDeleteActiveInkLayer}
+            onToggleInkLayerVisible={handleToggleInkLayerVisible}
+            onToggleInkLayerLocked={handleToggleInkLayerLocked}
+            onRenameInkLayer={handleRenameInkLayer}
+            objectsVisible={objectsVisible}
+            onToggleObjectsVisible={() => setObjectsVisible((v) => !v)}
+            paperVisible={paperVisible}
+            onTogglePaperVisible={() => setPaperVisible((v) => !v)}
+            templateId={templateId}
+            onOpenPaperTool={() => setActiveTool("paper")}
+            images={images}
+            texts={texts}
+            stamps={stamps}
+          />
+        </aside>
       </main>
 
       {/* =====================================================================
-          FRAMES & STUDIO ADMIN DIALOG
+          SCRAPBOOK GALLERY DIALOG
+         ===================================================================== */}
+      <ScrapbookDialog
+        dialogRef={scrapbookDialogRef}
+        notes={state?.notes || []}
+        selectedRecipientLabel={formatRecipientFriendly(selectedRecipient)}
+        showHardwareLut={showHardwareLut}
+        onToggleAllHardwareLut={() => {
+          const anyOn = Object.values(showHardwareLut).some(Boolean);
+          const next: Record<string, boolean> = {};
+          state?.notes.forEach((n) => {
+            next[n.id] = !anyOn;
+          });
+          setShowHardwareLut(next);
+        }}
+        formatRecipientFriendly={formatRecipientFriendly}
+        onRemix={handleRemixNote}
+        onResend={handleResend}
+        onConfirmDelete={confirmDeleteNote}
+        onClose={() => closeTopLayer(scrapbookDialogRef.current)}
+      />
+
+      {/* =====================================================================
+          FRAMES & SETTINGS DIALOG (Warm Craft Theme)
          ===================================================================== */}
       <dialog
         ref={adminDialogRef}
         id="admin-settings-dialog"
         {...({ closedby: "any" } as any)}
         aria-labelledby="admin-dialog-title"
-        className="m-auto w-full max-w-3xl rounded-3xl border border-stone-200 bg-[#faf6ef] p-0 text-stone-900 shadow-2xl"
+        className="m-auto w-[min(94vw,48rem)] rounded-3xl border-2 border-[var(--card-border)] bg-[#fffdf9] p-0 text-stone-900 shadow-2xl"
       >
-        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-stone-200/80 bg-white/90 px-6 py-4 backdrop-blur-md">
+        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-[var(--card-border)] bg-[#f7f1e6] px-5 py-3.5">
           <div className="flex items-center gap-2.5">
             <div
-              className="flex h-9 w-9 items-center justify-center rounded-xl bg-stone-900 text-white"
+              className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#25467a] text-white shadow-sm"
               aria-hidden="true"
             >
               <Sliders className="h-4 w-4" />
             </div>
             <div>
-              <h2 id="admin-dialog-title" className="text-base font-extrabold text-stone-900">
-                Frames &amp; Studio Admin
+              <h2 id="admin-dialog-title" className="text-sm font-extrabold text-stone-900">
+                Desk Frames &amp; Photo Dithering
               </h2>
-              <p className="text-xs text-stone-500">
-                Hardware telemetry, polling endpoints, dithering algorithms &amp; diagnostics
+              <p className="text-[11px] text-[#6b6359]">
+                E-paper frame status, firmware check-in URLs &amp; photo print settings
               </p>
             </div>
           </div>
@@ -3017,7 +3473,7 @@ export default function App() {
               type="button"
               onClick={fetchState}
               disabled={isLoading}
-              className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl border border-stone-200 bg-white px-3 py-1.5 text-xs font-bold text-stone-700 shadow-sm hover:bg-stone-50"
+              className="inline-flex min-h-[32px] items-center gap-1.5 rounded-xl border border-[var(--card-border)] bg-white px-2.5 py-1 text-xs font-bold text-stone-800 hover:bg-[#f5efe4]"
             >
               <RefreshCw
                 className={`h-3.5 w-3.5 ${isLoading ? "animate-spin" : ""}`}
@@ -3028,25 +3484,27 @@ export default function App() {
             <button
               type="button"
               onClick={() => closeTopLayer(adminDialogRef.current)}
-              aria-label="Close Frames and Studio Admin"
-              className="inline-flex min-h-[36px] min-w-[36px] items-center justify-center rounded-xl border border-stone-200 bg-white p-1.5 text-stone-600 hover:bg-stone-100"
+              aria-label="Close Frames and Settings"
+              className="inline-flex min-h-[32px] min-w-[32px] items-center justify-center rounded-xl border border-[var(--card-border)] bg-white p-1.5 text-stone-700 hover:bg-[#f5efe4]"
             >
               <X className="h-4 w-4" aria-hidden="true" />
             </button>
           </div>
         </div>
 
-        <div className="max-h-[78vh] overflow-y-auto p-6 space-y-6">
+        <div className="max-h-[76vh] space-y-5 overflow-y-auto bg-[#faf6ef] p-5">
           <section aria-labelledby="admin-devices-heading">
             <div className="mb-3 flex items-center justify-between">
               <h3
                 id="admin-devices-heading"
-                className="flex items-center gap-2 text-xs font-extrabold uppercase tracking-wider text-stone-600"
+                className="flex items-center gap-2 text-xs font-extrabold uppercase tracking-wider text-[#6b6359]"
               >
                 <Wifi className="h-4 w-4 text-[#25467a]" aria-hidden="true" />
-                Connected E-Paper Displays ({devicesList.length})
+                Connected Desk Frames ({devicesList.length})
               </h3>
-              <span className="text-xs text-stone-500">Spectra 6 • 800×480 • 15m wake cycle</span>
+              <span className="text-xs font-semibold text-[#6b6359]">
+                Spectra 6 • 800×480 • 15m wake cycle
+              </span>
             </div>
 
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -3059,18 +3517,20 @@ export default function App() {
                 return (
                   <div
                     key={device.device_id}
-                    className="flex flex-col justify-between rounded-2xl border border-stone-200 bg-white p-4 shadow-sm"
+                    className="flex flex-col justify-between rounded-2xl border-2 border-[var(--card-border)] bg-[#fffdf9] p-4 shadow-[0_3px_0_var(--card-shadow)]"
                   >
                     <div>
-                      <div className="flex items-start justify-between border-b border-stone-100 pb-3">
+                      <div className="flex items-start justify-between border-b border-[var(--card-border)] pb-3">
                         <div>
                           <div className="flex items-center gap-2">
-                            <h4 className="font-bold text-stone-900">{device.display_name}</h4>
-                            <code className="rounded-md bg-stone-100 px-1.5 py-0.5 text-[11px] font-mono text-stone-600">
+                            <h4 className="font-extrabold text-stone-900">
+                              {device.display_name}
+                            </h4>
+                            <code className="rounded bg-[#f5efe4] px-1.5 py-0.5 text-[11px] font-mono text-[#6b6359]">
                               {device.device_id}
                             </code>
                           </div>
-                          <p className="mt-1 flex items-center gap-1.5 text-xs text-stone-500">
+                          <p className="mt-1 flex items-center gap-1.5 text-xs text-[#6b6359]">
                             <span
                               className={`inline-block h-2 w-2 rounded-full ${
                                 hasRecentCheckIn ? "bg-emerald-500" : "bg-amber-400"
@@ -3081,27 +3541,22 @@ export default function App() {
                           </p>
                         </div>
 
-                        <div className="flex items-center gap-1 rounded-full border border-stone-200/80 bg-stone-50 px-2.5 py-1">
+                        <div className="flex items-center gap-1 rounded-full border border-[var(--card-border)] bg-[#faf6ef] px-2.5 py-1">
                           <Battery
                             className={`h-3.5 w-3.5 ${
-                              (device.battery_pct ?? 100) > 40 ? "text-emerald-600" : "text-amber-500"
+                              (device.battery_pct ?? 100) > 40 ? "text-emerald-600" : "text-amber-600"
                             }`}
                             aria-hidden="true"
                           />
-                          <span className="text-xs font-bold text-stone-700">
+                          <span className="text-xs font-bold text-stone-800">
                             {device.battery_pct !== null && device.battery_pct !== undefined
                               ? `${device.battery_pct}%`
                               : "USB"}
                           </span>
-                          {device.battery_mv && (
-                            <span className="text-[10px] text-stone-400">
-                              ({device.battery_mv}mV)
-                            </span>
-                          )}
                         </div>
                       </div>
 
-                      <div className="mt-3 overflow-hidden rounded-xl border border-stone-200 bg-stone-100 aspect-[5/3] relative">
+                      <div className="relative mt-3 aspect-[5/3] overflow-hidden rounded-xl border border-[var(--card-border)] bg-[#e8e4d9]">
                         <img
                           src={
                             device.active_note_id
@@ -3114,12 +3569,12 @@ export default function App() {
                           loading="lazy"
                           className="h-full w-full object-cover"
                         />
-                        <div className="absolute bottom-2 left-2 rounded bg-black/70 px-2 py-0.5 font-mono text-[10px] text-white">
+                        <div className="absolute bottom-2 left-2 rounded-md bg-black/70 px-2 py-0.5 font-mono text-[10px] text-white">
                           ETag: {device.active_etag || "welcome"}
                         </div>
                       </div>
 
-                      <div className="mt-3 flex items-center justify-between text-xs text-stone-600">
+                      <div className="mt-3 flex items-center justify-between text-xs text-[#6b6359]">
                         <div className="flex items-center gap-3">
                           <span className="flex items-center gap-1">
                             <Thermometer className="h-3.5 w-3.5 text-rose-500" aria-hidden="true" />
@@ -3131,7 +3586,7 @@ export default function App() {
                           </span>
                         </div>
                         {device.sleep_duration_s && (
-                          <span className="flex items-center gap-1 text-[11px] text-stone-400">
+                          <span className="flex items-center gap-1 text-[11px]">
                             <Clock className="h-3 w-3" aria-hidden="true" />
                             Sleep: {Math.round(device.sleep_duration_s / 60)}m
                           </span>
@@ -3139,19 +3594,19 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="mt-4 border-t border-stone-100 pt-3">
-                      <p className="mb-1.5 text-[11px] font-semibold text-stone-500">
-                        ESP32 Firmware Auto-Rotate URL:
+                    <div className="mt-4 border-t border-[var(--card-border)] pt-3">
+                      <p className="mb-1.5 text-[11px] font-bold text-[#6b6359]">
+                        ESP32 Firmware URL:
                       </p>
                       <div className="flex items-center gap-1.5">
-                        <code className="flex-1 overflow-hidden rounded-lg border border-stone-200 bg-stone-50 px-2.5 py-1.5 text-[11px] font-mono text-stone-600 truncate select-all">
+                        <code className="flex-1 truncate select-all overflow-hidden rounded-lg border border-[var(--card-border)] bg-[#faf6ef] px-2 py-1 text-[11px] font-mono text-stone-800">
                           {fullPollUrl}
                         </code>
                         <button
                           type="button"
                           onClick={() => handleCopyUrl(fullPollUrl)}
                           aria-label={`Copy firmware URL for ${device.display_name}`}
-                          className="inline-flex min-h-[32px] items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-stone-700 hover:bg-stone-50"
+                          className="inline-flex min-h-[30px] items-center gap-1 rounded-lg border border-[var(--card-border)] bg-white px-2 py-1 text-xs font-bold text-stone-700 hover:bg-[#f5efe4]"
                         >
                           {copiedUrl === fullPollUrl ? (
                             <>
@@ -3160,7 +3615,7 @@ export default function App() {
                             </>
                           ) : (
                             <>
-                              <Copy className="h-3.5 w-3.5 text-stone-500" aria-hidden="true" />
+                              <Copy className="h-3.5 w-3.5" aria-hidden="true" />
                               <span>Copy</span>
                             </>
                           )}
@@ -3170,7 +3625,7 @@ export default function App() {
                           onClick={() => handleSimulatePoll(device.device_id, device.active_etag)}
                           disabled={isSimulating}
                           aria-label={`Simulate hardware check-in for ${device.display_name}`}
-                          className="inline-flex min-h-[32px] items-center gap-1 rounded-lg bg-stone-800 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-stone-900 disabled:opacity-50"
+                          className="inline-flex min-h-[30px] items-center gap-1 rounded-lg bg-stone-800 px-2.5 py-1 text-xs font-bold text-white hover:bg-stone-900 disabled:opacity-50"
                         >
                           <RefreshCw
                             className={`h-3.5 w-3.5 ${isSimulating ? "animate-spin" : ""}`}
@@ -3181,7 +3636,7 @@ export default function App() {
                       </div>
 
                       {simulationResult && simulationResult.deviceId === device.device_id && (
-                        <div className="mt-2 rounded-lg bg-stone-100 p-2 text-xs font-mono text-stone-700">
+                        <div className="mt-2 rounded-lg bg-[#f5efe4] p-2 text-xs font-mono text-stone-800">
                           {simulationResult.text}
                         </div>
                       )}
@@ -3194,69 +3649,39 @@ export default function App() {
 
           <section
             aria-labelledby="admin-pipeline-heading"
-            className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm"
+            className="rounded-2xl border-2 border-[var(--card-border)] bg-[#fffdf9] p-4 shadow-[0_3px_0_var(--card-shadow)]"
           >
             <h3
               id="admin-pipeline-heading"
-              className="mb-3 flex items-center gap-2 text-xs font-extrabold uppercase tracking-wider text-stone-600"
+              className="mb-3 flex items-center gap-2 text-xs font-extrabold uppercase tracking-wider text-[#6b6359]"
             >
               <Wand2 className="h-4 w-4 text-[#25467a]" aria-hidden="true" />
-              Spectra 6 Rendering &amp; Security Settings
+              Photo Print Dithering
             </h3>
 
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div>
-                <p className="text-xs font-bold text-stone-800">Photo Dithering Algorithm</p>
-                <p className="mb-2 text-[11px] text-stone-500">
-                  Controls how uploaded photo collages map to the 6 e-paper pigments (hand-drawn strokes, text, and stamps stay un-dithered).
-                </p>
-                <div
-                  role="group"
-                  aria-label="Photo dithering algorithm"
-                  className="inline-flex rounded-xl bg-stone-100 p-1"
-                >
-                  {(["floyd", "atkinson", "bayer", "nearest"] as DitherAlgo[]).map((algo) => (
-                    <button
-                      key={algo}
-                      type="button"
-                      aria-pressed={ditherAlgo === algo}
-                      onClick={() => setDitherAlgo(algo)}
-                      className={`min-h-[32px] rounded-lg px-2.5 py-1 text-xs font-bold capitalize transition ${
-                        ditherAlgo === algo
-                          ? "bg-white text-stone-900 shadow-sm"
-                          : "text-stone-600 hover:text-stone-900"
-                      }`}
-                    >
-                      {algo}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <p className="text-xs font-bold text-stone-800">Hardware LUT Inspection</p>
-                <p className="mb-2 text-[11px] text-stone-500">
-                  Toggle Scrapbook previews between natural perceived e-paper colors and raw hardware RGB LUT values.
-                </p>
+            <p className="mb-2 text-xs text-[#6b6359]">
+              Controls how imported photo cutouts blend onto the 6 e-paper pigments (hand-drawn lines, Riso halftones, labels, and stamps stay razor-crisp).
+            </p>
+            <div
+              role="group"
+              aria-label="Photo dithering algorithm"
+              className="inline-flex rounded-xl border border-[var(--card-border)] bg-[#f5efe4] p-1"
+            >
+              {(["floyd", "atkinson", "bayer", "nearest"] as DitherAlgo[]).map((algo) => (
                 <button
+                  key={algo}
                   type="button"
-                  onClick={() => {
-                    const anyOn = Object.values(showHardwareLut).some(Boolean);
-                    const next: Record<string, boolean> = {};
-                    state?.notes.forEach((n) => {
-                      next[n.id] = !anyOn;
-                    });
-                    setShowHardwareLut(next);
-                  }}
-                  className="inline-flex min-h-[34px] items-center gap-1.5 rounded-xl border border-stone-200 bg-stone-50 px-3 py-1.5 text-xs font-bold text-stone-700 hover:bg-stone-100"
+                  aria-pressed={ditherAlgo === algo}
+                  onClick={() => setDitherAlgo(algo)}
+                  className={`min-h-[30px] rounded-lg px-3 py-1 text-xs font-bold capitalize transition ${
+                    ditherAlgo === algo
+                      ? "bg-[#25467a] text-white shadow-sm"
+                      : "text-stone-700 hover:bg-white"
+                  }`}
                 >
-                  <span>
-                    {Object.values(showHardwareLut).some(Boolean)
-                      ? "Showing Raw Hardware LUT (Switch to Perceived)"
-                      : "Showing Perceived Colors (Switch to Raw LUT)"}
-                  </span>
+                  {algo}
                 </button>
-              </div>
+              ))}
             </div>
           </section>
         </div>
@@ -3270,12 +3695,12 @@ export default function App() {
         id="delete-note-dialog"
         {...({ closedby: "any" } as any)}
         aria-labelledby="delete-dialog-title"
-        className="m-auto w-full max-w-sm rounded-3xl border border-stone-200 bg-white p-6 text-stone-900 shadow-xl"
+        className="m-auto w-[min(90vw,24rem)] rounded-3xl border-2 border-[var(--card-border)] bg-[#fffdf9] p-6 text-stone-900 shadow-xl"
       >
         <h2 id="delete-dialog-title" className="text-base font-extrabold text-stone-900">
           Toss this postcard?
         </h2>
-        <p className="mt-1.5 text-xs text-stone-600">
+        <p className="mt-1.5 text-xs text-[#6b6359]">
           This removes the doodle from your shared Postcard Scrapbook.
         </p>
         <div className="mt-5 flex items-center justify-end gap-2">
@@ -3283,14 +3708,14 @@ export default function App() {
             type="button"
             autoFocus
             onClick={() => closeTopLayer(deleteDialogRef.current)}
-            className="min-h-[38px] rounded-xl border border-stone-200 bg-white px-4 py-2 text-xs font-bold text-stone-700 hover:bg-stone-50"
+            className="min-h-[36px] rounded-xl border border-[var(--card-border)] bg-white px-4 py-1.5 text-xs font-bold text-stone-700 hover:bg-[#f5efe4]"
           >
             Keep It
           </button>
           <button
             type="button"
             onClick={executeDeleteNote}
-            className="min-h-[38px] rounded-xl bg-rose-600 px-4 py-2 text-xs font-bold text-white shadow-sm hover:bg-rose-700"
+            className="min-h-[36px] rounded-xl bg-rose-600 px-4 py-1.5 text-xs font-bold text-white shadow-sm hover:bg-rose-700"
           >
             Delete Postcard
           </button>

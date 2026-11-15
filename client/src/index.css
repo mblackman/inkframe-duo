@@ -5,15 +5,48 @@
 :root {
   font-family: "Avenir Next", "Nunito", "Quicksand", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   color-scheme: light;
+  --target-size: 28px;
+
+  --desk-bg: #faf6ef;
+  --desk-dot: #ded6c6;
+  --card-surface: #fffdf9;
+  --card-subtle: #f5efe4;
+  --card-hover: #efe7d8;
+  --card-border: #dfd6c5;
+  --card-shadow: #e4dac8;
+  --ink-text: #292524;
+  --ink-muted: #6b6359;
+  --accent-cobalt: #25467a;
+  --accent-crimson: #9e2a1f;
+  --accent-sunbeam: #d9b82c;
+
+  accent-color: var(--accent-cobalt);
+}
+
+@media (pointer: coarse) {
+  :root {
+    --target-size: 44px;
+  }
 }
 
 body {
   margin: 0;
   min-height: 100vh;
+  min-height: 100dvh;
+  background-color: var(--desk-bg);
+  background-image: radial-gradient(var(--desk-dot) 1.35px, transparent 1.35px);
+  background-size: 22px 22px;
+  color: var(--ink-text);
+  overflow-wrap: anywhere;
   touch-action: manipulation;
-  background-color: #faf6ef;
-  background-image: radial-gradient(#dfd9cc 1.25px, transparent 1.25px);
-  background-size: 24px 24px;
+}
+
+h1, h2, h3 {
+  text-wrap: balance;
+}
+
+p, li {
+  text-wrap: pretty;
 }
 
 /* Smooth drawing canvas touch handling */
@@ -34,10 +67,135 @@ canvas {
   white-space: nowrap !important;
 }
 
-/* Custom high-contrast focus ring */
-:where(a:any-link, button, input, textarea, select, summary):focus-visible {
-  outline: 3px solid #25467a;
+/* High-contrast keyboard focus ring */
+:where(a:any-link, button, input, textarea, select, summary, [tabindex]):focus-visible {
+  outline: 2px solid #25467a;
   outline-offset: 3px;
+}
+
+/* Decorative translucent washi tape strips */
+.washi-tape-amber {
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    -45deg,
+    rgba(217, 184, 44, 0.44),
+    rgba(217, 184, 44, 0.44) 8px,
+    rgba(255, 250, 226, 0.68) 8px,
+    rgba(255, 250, 226, 0.68) 16px
+  );
+  box-shadow: 0 2px 5px rgba(41, 37, 36, 0.14);
+}
+
+.washi-tape-rose {
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(158, 42, 31, 0.24),
+    rgba(158, 42, 31, 0.24) 8px,
+    rgba(255, 245, 240, 0.72) 8px,
+    rgba(255, 245, 240, 0.72) 16px
+  );
+  box-shadow: 0 2px 5px rgba(41, 37, 36, 0.14);
+}
+
+/* Tactile spring interactions for Pencil Case & Ink Pots (no opacity overshoot) */
+.spring-tool,
+.spring-pot {
+  transition: translate 200ms ease-out, rotate 200ms ease-out, scale 150ms ease-out, box-shadow 150ms ease-out;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .spring-tool,
+  .spring-pot {
+    transition-duration: 380ms, 380ms, 160ms, 160ms;
+    transition-timing-function:
+      linear(0, 0.45 15%, 1.13 35%, 0.96 56%, 1.02 76%, 1),
+      linear(0, 0.45 15%, 1.13 35%, 0.96 56%, 1.02 76%, 1),
+      ease-out,
+      ease-out;
+  }
+}
+
+@media (hover: hover) {
+  .spring-tool:hover:not([aria-pressed="true"]):not([aria-disabled="true"]),
+  .spring-pot:hover:not([aria-pressed="true"]):not([aria-disabled="true"]) {
+    translate: 0 -2px;
+    box-shadow: 0 4px 10px rgba(41, 37, 36, 0.1);
+  }
+}
+
+.spring-tool[aria-pressed="true"] {
+  translate: 0 -4px;
+  rotate: -2deg;
+}
+
+.spring-pot[aria-pressed="true"] {
+  translate: 0 -3px;
+  scale: 1.08;
+}
+
+.spring-tool:active:not([aria-disabled="true"]),
+.spring-pot:active:not([aria-disabled="true"]) {
+  scale: 0.95;
+}
+
+/* Accessible ARIA-driven toolbar styling */
+[role="toolbar"] button,
+[role="toolbar"] [role="button"] {
+  min-inline-size: var(--target-size);
+  min-block-size: var(--target-size);
+  border: 1px solid transparent;
+}
+
+[role="toolbar"] button[aria-pressed="true"] {
+  background-color: #25467a;
+  color: #ffffff;
+  border-color: #1c355e;
+  box-shadow: 0 2px 0 #162a4b;
+}
+
+[role="toolbar"] button[aria-disabled="true"] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+[role="toolbar"] [role="separator"][aria-orientation="vertical"] {
+  display: inline-block;
+  align-self: stretch;
+  inline-size: 0;
+  min-block-size: 1.25rem;
+  border-inline-start: 1px solid var(--card-border);
+  margin-inline: 0.25rem;
+}
+
+@media (forced-colors: active) {
+  [role="toolbar"] button {
+    border: 1px solid ButtonText;
+  }
+  [role="toolbar"] button[aria-pressed="true"] {
+    background-color: Highlight;
+    color: HighlightText;
+    border-color: Highlight;
+  }
+  [role="toolbar"] [role="separator"] {
+    border-color: ButtonText;
+  }
+}
+
+/* Swipeable horizontal trays without intrusive scrollbars */
+.tray-scroller {
+  display: flex;
+  overflow-x: auto;
+  scrollbar-width: none;
+  scroll-snap-type: x proximity;
+}
+
+.tray-scroller > * {
+  scroll-snap-align: start;
+}
+
+.tray-scroller::-webkit-scrollbar {
+  display: none;
 }
 
 /* Native modal dialog scroll containment & top-layer transitions */
@@ -48,10 +206,10 @@ dialog:modal {
 dialog::backdrop {
   overflow: hidden;
   overscroll-behavior: contain;
-  background-color: rgb(28 25 23 / 0);
+  background-color: rgb(41 37 36 / 0);
   backdrop-filter: blur(0px);
   transition-property: background-color, backdrop-filter, display, overlay;
-  transition-duration: 0.25s;
+  transition-duration: 0.24s;
   transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
   transition-behavior: allow-discrete;
 }
@@ -60,7 +218,7 @@ dialog {
   opacity: 0;
   transform: scale(0.95) translateY(8px);
   transition-property: opacity, transform, display, overlay;
-  transition-duration: 0.25s;
+  transition-duration: 0.24s;
   transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
   transition-behavior: allow-discrete;
 }
@@ -76,11 +234,11 @@ dialog[open]:where(:not([data-closing])) {
 }
 
 dialog[open]:where(:not([data-closing]))::backdrop {
-  background-color: rgb(28 25 23 / 0.45);
+  background-color: rgb(41 37 36 / 0.42);
   backdrop-filter: blur(4px);
 
   @starting-style {
-    background-color: rgb(28 25 23 / 0);
+    background-color: rgb(41 37 36 / 0);
     backdrop-filter: blur(0px);
   }
 }
@@ -97,16 +255,4 @@ dialog[open]:where(:not([data-closing]))::backdrop {
       transform: none;
     }
   }
-}
-
-/* Washi tape decorative strip */
-.washi-tape {
-  background: repeating-linear-gradient(
-    -45deg,
-    rgba(217, 184, 44, 0.38),
-    rgba(217, 184, 44, 0.38) 8px,
-    rgba(255, 250, 225, 0.55) 8px,
-    rgba(255, 250, 225, 0.55) 16px
-  );
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }

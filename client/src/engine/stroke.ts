@@ -1,4 +1,9 @@
-import type { BrushStyle, DrawMode } from "../types";
+import type {
+  BrushStyle,
+  EraserStyle,
+  FigureFillMode,
+  FigureShape,
+} from "../types";
 
 export interface StrokeInputPoint {
   x: number;
@@ -29,20 +34,57 @@ export function shouldPaintHalftonePixel(x: number, y: number): boolean {
 }
 
 /**
- * C1-continuous quadratic Bézier stroke interpolator with coalesced-point support,
- * velocity/pressure dynamics, and dense equidistant stamp emission so fast movement
- * never creates gaps.
+ * Deterministic screentone / dry-stipple pixel mask for Spectra 6 optical mixing.
+ * - tone25: 25% coverage (1 of 4 2x2 blocks)
+ * - halftone: 50% coverage (2x2 checkerboard)
+ * - tone75: 75% coverage (3 of 4 2x2 blocks)
+ * - pencil: ~60% deterministic hash stipple
+ */
+export function shouldPaintTonePixel(
+  x: number,
+  y: number,
+  style: "tone25" | "halftone" | "tone75" | "pencil"
+): boolean {
+  if (style === "halftone") {
+    return shouldPaintHalftonePixel(x, y);
+  }
+  if (style === "tone25") {
+    const bx = Math.floor(x / 2) & 1;
+    const by = Math.floor(y / 2) & 1;
+    return bx === 0 && by === 0;
+  }
+  if (style === "tone75") {
+    const bx = Math.floor(x / 2) & 1;
+    const by = Math.floor(y / 2) & 1;
+    return !(bx === 1 && by === 1);
+  }
+  const h = (((Math.floor(x) * 73856093) ^ (Math.floor(y) * 19349663)) >>> 0) % 5;
+  return h < 3;
+}
+
+/**
+ * C1-continuous quadratic Bézier stroke interpolator with optional EMA stabilization,
+ * coalesced-point support, velocity/pressure dynamics, and dense equidistant stamp emission.
  */
 export class StrokeSmoother {
   private readonly baseSize: number;
   private readonly style: BrushStyle | "eraser";
+  private readonly stabilization: number;
+  private readonly taper: boolean;
   private prevPt: StrokeInputPoint | null = null;
   private lastMid: { x: number; y: number } | null = null;
+  private lastRawPt: StrokeInputPoint | null = null;
   private smoothedRadius: number;
 
-  constructor(brushSize: number, style: BrushStyle | "eraser" = "pen") {
+  constructor(
+    brushSize: number,
+    style: BrushStyle | "eraser" = "pen",
+    options?: { stabilization?: number; taper?: boolean }
+  ) {
     this.baseSize = Math.max(1, brushSize);
     this.style = style;
+    this.stabilization = clamp(options?.stabilization ?? 0, 0, 10);
+    this.taper = options?.taper ?? true;
     this.smoothedRadius = this.baseSize / 2;
   }
 
@@ -51,7 +93,7 @@ export class StrokeSmoother {
     curr: StrokeInputPoint
   ): number {
     const baseRadius = this.baseSize / 2;
-    if (this.style !== "pen") {
+    if (this.style !== "pen" || !this.taper) {
       return baseRadius;
     }
 
@@ -83,6 +125,7 @@ export class StrokeSmoother {
     const initialRadius = this.computeTargetRadius(null, pt);
     this.smoothedRadius = initialRadius;
     this.prevPt = pt;
+    this.lastRawPt = pt;
     this.lastMid = { x: pt.x, y: pt.y };
     return [{ x: pt.x, y: pt.y, radius: initialRadius }];
   }
@@ -92,14 +135,26 @@ export class StrokeSmoother {
       return this.startStroke(pt);
     }
 
+    this.lastRawPt = pt;
+
+    let effectivePt = pt;
+    if (this.stabilization > 0) {
+      const alpha = clamp(1 - this.stabilization * 0.075, 0.22, 1);
+      effectivePt = {
+        ...pt,
+        x: this.prevPt.x + (pt.x - this.prevPt.x) * alpha,
+        y: this.prevPt.y + (pt.y - this.prevPt.y) * alpha,
+      };
+    }
+
     const prevRadius = this.smoothedRadius;
-    const targetRadius = this.computeTargetRadius(this.prevPt, pt);
+    const targetRadius = this.computeTargetRadius(this.prevPt, effectivePt);
     const nextRadius = prevRadius * 0.72 + targetRadius * 0.28;
     this.smoothedRadius = nextRadius;
 
     const mid = {
-      x: (this.prevPt.x + pt.x) / 2,
-      y: (this.prevPt.y + pt.y) / 2,
+      x: (this.prevPt.x + effectivePt.x) / 2,
+      y: (this.prevPt.y + effectivePt.y) / 2,
     };
 
     const stamps = this.sampleQuadratic(
@@ -111,31 +166,38 @@ export class StrokeSmoother {
     );
 
     this.lastMid = mid;
-    this.prevPt = pt;
+    this.prevPt = effectivePt;
     return stamps;
   }
 
   public finishStroke(): StampPoint[] {
     if (!this.prevPt || !this.lastMid) return [];
+    const endTarget =
+      this.stabilization > 0 && this.lastRawPt ? this.lastRawPt : this.prevPt;
     const dist = Math.hypot(
-      this.prevPt.x - this.lastMid.x,
-      this.prevPt.y - this.lastMid.y
+      endTarget.x - this.lastMid.x,
+      endTarget.y - this.lastMid.y
     );
     if (dist < 0.1) {
       this.prevPt = null;
       this.lastMid = null;
+      this.lastRawPt = null;
       return [];
     }
 
+    const ctrl =
+      this.stabilization > 0 && this.lastRawPt ? this.prevPt : this.lastMid;
+
     const stamps = this.sampleQuadratic(
       this.lastMid,
-      this.lastMid,
-      this.prevPt,
+      ctrl,
+      endTarget,
       this.smoothedRadius,
       this.smoothedRadius
     );
     this.prevPt = null;
     this.lastMid = null;
+    this.lastRawPt = null;
     return stamps;
   }
 
@@ -170,27 +232,34 @@ export class StrokeSmoother {
   }
 }
 
-const halftonePatternCache = new Map<string, CanvasPattern>();
+const tonePatternCache = new Map<string, CanvasPattern>();
 
-function getHalftonePattern(
+function getTonePattern(
   ctx: CanvasRenderingContext2D,
-  colorHex: string
+  style: "tone25" | "halftone" | "tone75" | "pencil",
+  colorHex: string,
+  subColorHex?: string | null
 ): CanvasPattern | string {
-  const cached = halftonePatternCache.get(colorHex);
+  const key = `${style}:${colorHex}:${subColorHex ?? "none"}`;
+  const cached = tonePatternCache.get(key);
   if (cached) return cached;
   if (typeof document === "undefined") return colorHex;
 
+  const tileSize = style === "pencil" ? 16 : 4;
   const tile = document.createElement("canvas");
-  tile.width = 4;
-  tile.height = 4;
+  tile.width = tileSize;
+  tile.height = tileSize;
   const tctx = tile.getContext("2d");
   if (!tctx) return colorHex;
 
-  tctx.clearRect(0, 0, 4, 4);
-  tctx.fillStyle = colorHex;
-  for (let y = 0; y < 4; y++) {
-    for (let x = 0; x < 4; x++) {
-      if (shouldPaintHalftonePixel(x, y)) {
+  tctx.clearRect(0, 0, tileSize, tileSize);
+  for (let y = 0; y < tileSize; y++) {
+    for (let x = 0; x < tileSize; x++) {
+      if (shouldPaintTonePixel(x, y, style)) {
+        tctx.fillStyle = colorHex;
+        tctx.fillRect(x, y, 1, 1);
+      } else if (subColorHex) {
+        tctx.fillStyle = subColorHex;
         tctx.fillRect(x, y, 1, 1);
       }
     }
@@ -198,10 +267,21 @@ function getHalftonePattern(
 
   const pattern = ctx.createPattern(tile, "repeat");
   if (pattern) {
-    halftonePatternCache.set(colorHex, pattern);
+    tonePatternCache.set(key, pattern);
     return pattern;
   }
   return colorHex;
+}
+
+function isPatternBrushStyle(
+  style: BrushStyle | "eraser"
+): style is "tone25" | "halftone" | "tone75" | "pencil" {
+  return (
+    style === "tone25" ||
+    style === "halftone" ||
+    style === "tone75" ||
+    style === "pencil"
+  );
 }
 
 /**
@@ -212,16 +292,25 @@ export function renderStampsToContext(
   stamps: StampPoint[],
   style: BrushStyle | "eraser",
   colorHex: string,
-  isEraser: boolean
+  isEraser: boolean,
+  renderOpts?: { subColorHex?: string | null; eraserStyle?: EraserStyle }
 ): void {
   if (stamps.length === 0) return;
 
   ctx.save();
   ctx.globalCompositeOperation = isEraser ? "destination-out" : "source-over";
-  ctx.fillStyle =
-    !isEraser && style === "halftone"
-      ? getHalftonePattern(ctx, colorHex)
-      : colorHex;
+
+  if (isEraser) {
+    ctx.fillStyle =
+      renderOpts?.eraserStyle === "kneaded"
+        ? getTonePattern(ctx, "halftone", "#000000", null)
+        : "#000000";
+  } else if (isPatternBrushStyle(style)) {
+    const subHex = style === "pencil" ? null : renderOpts?.subColorHex ?? null;
+    ctx.fillStyle = getTonePattern(ctx, style, colorHex, subHex);
+  } else {
+    ctx.fillStyle = colorHex;
+  }
 
   if (style === "calligraphy" && !isEraser) {
     const angle = -Math.PI / 5; // -36 deg chisel angle
@@ -247,19 +336,84 @@ export function renderStampsToContext(
 }
 
 /**
- * Draws crisp vector geometric or heart shapes on a Canvas2D context.
+ * Constrains shape end coordinates when Shift-constrain is active:
+ * - line: snaps to 15-degree increments
+ * - box shapes: locks 1:1 square aspect ratio
+ */
+export function constrainShapePoints(
+  mode: FigureShape,
+  p0: { x: number; y: number },
+  p1: { x: number; y: number },
+  shiftConstrain: boolean
+): { x: number; y: number } {
+  if (!shiftConstrain) return p1;
+  const dx = p1.x - p0.x;
+  const dy = p1.y - p0.y;
+
+  if (mode === "line") {
+    const dist = Math.hypot(dx, dy);
+    if (dist < 0.001) return p1;
+    const rawAngle = Math.atan2(dy, dx);
+    const step = Math.PI / 12; // 15 deg
+    const snapped = Math.round(rawAngle / step) * step;
+    return {
+      x: p0.x + Math.cos(snapped) * dist,
+      y: p0.y + Math.sin(snapped) * dist,
+    };
+  }
+
+  const side = Math.max(Math.abs(dx), Math.abs(dy));
+  return {
+    x: p0.x + (dx >= 0 ? side : -side),
+    y: p0.y + (dy >= 0 ? side : -side),
+  };
+}
+
+/**
+ * Draws crisp vector geometric, heart, or star shapes on a Canvas2D context.
  */
 export function drawShape(
   ctx: CanvasRenderingContext2D,
-  mode: Exclude<DrawMode, "freehand" | "fill">,
+  mode: FigureShape,
   p0: { x: number; y: number },
   p1: { x: number; y: number },
   brushSize: number,
-  colorHex: string
+  colorHex: string,
+  shapeOpts?: {
+    fillMode?: FigureFillMode;
+    fillColorHex?: string;
+    shiftConstrain?: boolean;
+    isEraser?: boolean;
+    toneStyle?: "solid" | "tone25" | "halftone" | "tone75";
+    subColorHex?: string | null;
+  }
 ): void {
+  const endPt = constrainShapePoints(
+    mode,
+    p0,
+    p1,
+    Boolean(shapeOpts?.shiftConstrain)
+  );
+  const fillMode: FigureFillMode =
+    mode === "line" ? "stroke" : shapeOpts?.fillMode ?? "stroke";
+  const isEraser = Boolean(shapeOpts?.isEraser);
+  const toneStyle = shapeOpts?.toneStyle ?? "solid";
+  const strokePaint = isEraser
+    ? "#000000"
+    : toneStyle !== "solid"
+    ? getTonePattern(ctx, toneStyle, colorHex, shapeOpts?.subColorHex ?? null)
+    : colorHex;
+  const fillRawHex = shapeOpts?.fillColorHex ?? colorHex;
+  const fillPaint = isEraser
+    ? "#000000"
+    : toneStyle !== "solid"
+    ? getTonePattern(ctx, toneStyle, fillRawHex, shapeOpts?.subColorHex ?? null)
+    : fillRawHex;
+
   ctx.save();
-  ctx.globalCompositeOperation = "source-over";
-  ctx.strokeStyle = colorHex;
+  ctx.globalCompositeOperation = isEraser ? "destination-out" : "source-over";
+  ctx.strokeStyle = strokePaint;
+  ctx.fillStyle = fillPaint;
   ctx.lineWidth = brushSize;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
@@ -267,25 +421,23 @@ export function drawShape(
   if (mode === "line") {
     ctx.beginPath();
     ctx.moveTo(p0.x, p0.y);
-    ctx.lineTo(p1.x, p1.y);
+    ctx.lineTo(endPt.x, endPt.y);
     ctx.stroke();
     ctx.restore();
     return;
   }
 
-  const minX = Math.min(p0.x, p1.x);
-  const maxX = Math.max(p0.x, p1.x);
-  const minY = Math.min(p0.y, p1.y);
-  const maxY = Math.max(p0.y, p1.y);
+  const minX = Math.min(p0.x, endPt.x);
+  const maxX = Math.max(p0.x, endPt.x);
+  const minY = Math.min(p0.y, endPt.y);
+  const maxY = Math.max(p0.y, endPt.y);
   const w = maxX - minX;
   const h = maxY - minY;
 
+  ctx.beginPath();
   if (mode === "rect") {
-    ctx.beginPath();
     ctx.rect(minX, minY, w, h);
-    ctx.stroke();
   } else if (mode === "circle") {
-    ctx.beginPath();
     ctx.ellipse(
       minX + w / 2,
       minY + h / 2,
@@ -295,11 +447,9 @@ export function drawShape(
       0,
       Math.PI * 2
     );
-    ctx.stroke();
   } else if (mode === "heart") {
     const cx = minX + w / 2;
     const topY = minY + h * 0.28;
-    ctx.beginPath();
     ctx.moveTo(cx, maxY);
     ctx.bezierCurveTo(
       minX - w * 0.08,
@@ -318,6 +468,29 @@ export function drawShape(
       maxY
     );
     ctx.closePath();
+  } else if (mode === "star") {
+    const cx = minX + w / 2;
+    const cy = minY + h / 2;
+    const rxOuter = Math.max(2, w / 2);
+    const ryOuter = Math.max(2, h / 2);
+    const rxInner = rxOuter * 0.42;
+    const ryInner = ryOuter * 0.42;
+    for (let i = 0; i < 10; i++) {
+      const angle = -Math.PI / 2 + (i * Math.PI) / 5;
+      const rx = i % 2 === 0 ? rxOuter : rxInner;
+      const ry = i % 2 === 0 ? ryOuter : ryInner;
+      const px = cx + Math.cos(angle) * rx;
+      const py = cy + Math.sin(angle) * ry;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+  }
+
+  if (fillMode === "fill" || fillMode === "both") {
+    ctx.fill();
+  }
+  if (fillMode === "stroke" || fillMode === "both") {
     ctx.stroke();
   }
 
@@ -325,8 +498,35 @@ export function drawShape(
 }
 
 /**
+ * Combines alpha channels across multiple visible reference layers so
+ * Fill Bucket ("Refer All Layers") stops at lineart drawn on other layers.
+ */
+export function mergeBoundaryBuffers(
+  buffers: Array<Uint8ClampedArray | null | undefined>
+): Uint8ClampedArray | undefined {
+  const valid = buffers.filter(
+    (b): b is Uint8ClampedArray => Boolean(b && b.length > 0)
+  );
+  if (valid.length === 0) return undefined;
+  if (valid.length === 1) return valid[0];
+
+  const len = valid[0].length;
+  const out = new Uint8ClampedArray(len);
+  for (let i = 0; i < len; i += 4) {
+    let maxA = 0;
+    for (let k = 0; k < valid.length; k++) {
+      const a = valid[k][i + 3];
+      if (a > maxA) maxA = a;
+    }
+    out[i + 3] = maxA;
+  }
+  return out;
+}
+
+/**
  * Fast typed-array BFS flood fill for paint-bucket tool.
- * Respects both existing ink pixels and optional boundary pixels (e.g., stationery lines).
+ * Respects both existing ink pixels, optional multi-layer boundary pixels,
+ * and optional 2-color halftone/screentone fill patterns.
  */
 export function floodFillBuffer(
   data: Uint8ClampedArray,
@@ -335,7 +535,11 @@ export function floodFillBuffer(
   startX: number,
   startY: number,
   fillRgba: [number, number, number, number],
-  boundaryData?: Uint8ClampedArray
+  boundaryData?: Uint8ClampedArray,
+  patternOpts?: {
+    mode: "solid" | "tone25" | "halftone" | "tone75";
+    secondaryRgba?: [number, number, number, number] | null;
+  }
 ): boolean {
   const sx = Math.round(startX);
   const sy = Math.round(startY);
@@ -354,7 +558,10 @@ export function floodFillBuffer(
   const ta = data[startByte + 3];
 
   const [fr, fg, fb, fa] = fillRgba;
+  const patternMode = patternOpts?.mode ?? "solid";
+
   if (
+    patternMode === "solid" &&
     Math.abs(tr - fr) <= 4 &&
     Math.abs(tg - fg) <= 4 &&
     Math.abs(tb - fb) <= 4 &&
@@ -390,13 +597,26 @@ export function floodFillBuffer(
   while (head < tail) {
     const pos = queue[head++];
     const i = pos * 4;
-    data[i] = fr;
-    data[i + 1] = fg;
-    data[i + 2] = fb;
-    data[i + 3] = fa;
-
     const x = pos % width;
     const y = (pos - x) / width;
+
+    if (patternMode === "solid") {
+      data[i] = fr;
+      data[i + 1] = fg;
+      data[i + 2] = fb;
+      data[i + 3] = fa;
+    } else if (shouldPaintTonePixel(x, y, patternMode)) {
+      data[i] = fr;
+      data[i + 1] = fg;
+      data[i + 2] = fb;
+      data[i + 3] = fa;
+    } else if (patternOpts?.secondaryRgba) {
+      const [sr, sg, sb, sa] = patternOpts.secondaryRgba;
+      data[i] = sr;
+      data[i + 1] = sg;
+      data[i + 2] = sb;
+      data[i + 3] = sa;
+    }
 
     if (x > 0) {
       const n = pos - 1;
